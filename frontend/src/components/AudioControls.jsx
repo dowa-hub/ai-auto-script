@@ -2,7 +2,7 @@ export default function AudioControls({
   devices, deviceId, setDeviceId,
   isCapturing, inputRate, level,
   onStart, onStop,
-  connected, modelReady,
+  connected, modelReady, sttStatus,
 }) {
   const canStart = connected && modelReady && !isCapturing
   const bars     = 16
@@ -85,9 +85,9 @@ export default function AudioControls({
       </button>
 
       {/* Status pills */}
-      <div style={{ display: 'flex', gap: 6, marginLeft: 'auto' }}>
+      <div style={{ display: 'flex', gap: 6, marginLeft: 'auto', alignItems: 'center' }}>
         <StatusPill label="WS" ok={connected} />
-        <StatusPill label={modelReady ? 'Model ready' : 'Loading model…'} ok={modelReady} />
+        <SttPill sttStatus={sttStatus} modelReady={modelReady} />
       </div>
     </div>
   )
@@ -105,6 +105,58 @@ function StatusPill({ label, ok }) {
       border: `1px solid ${ok ? 'rgba(76,175,80,0.3)' : 'rgba(255,152,0,0.3)'}`,
     }}>
       {label}
+    </span>
+  )
+}
+
+function SttPill({ sttStatus, modelReady }) {
+  if (!modelReady && !sttStatus) {
+    return <StatusPill label="Loading model…" ok={false} />
+  }
+  if (!sttStatus) {
+    return <StatusPill label="STT ready" ok={true} />
+  }
+
+  if (sttStatus.engine === 'deepgram') {
+    if (sttStatus.connected) {
+      return (
+        <span style={{
+          fontSize: 11, fontWeight: 600, padding: '2px 10px', borderRadius: 999,
+          background: 'rgba(33,150,243,0.18)', color: '#64b5f6',
+          border: '1px solid rgba(33,150,243,0.4)',
+          display: 'flex', alignItems: 'center', gap: 5,
+        }}>
+          <span style={{ width: 7, height: 7, borderRadius: '50%', background: '#4caf50', display: 'inline-block' }} />
+          Deepgram {sttStatus.model}
+        </span>
+      )
+    } else {
+      return (
+        <span style={{
+          fontSize: 11, fontWeight: 600, padding: '2px 10px', borderRadius: 999,
+          background: 'rgba(244,67,54,0.15)', color: 'var(--red)',
+          border: '1px solid rgba(244,67,54,0.3)',
+          display: 'flex', alignItems: 'center', gap: 5,
+        }}
+          title={sttStatus.error || 'Connection failed'}
+        >
+          <span style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--red)', display: 'inline-block' }} />
+          Deepgram error
+        </span>
+      )
+    }
+  }
+
+  // Offline Whisper
+  return (
+    <span style={{
+      fontSize: 11, fontWeight: 500, padding: '2px 10px', borderRadius: 999,
+      background: 'rgba(76,175,80,0.12)', color: 'var(--green)',
+      border: '1px solid rgba(76,175,80,0.3)',
+      display: 'flex', alignItems: 'center', gap: 5,
+    }}>
+      <span style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--green)', display: 'inline-block' }} />
+      Whisper {sttStatus.model}
     </span>
   )
 }

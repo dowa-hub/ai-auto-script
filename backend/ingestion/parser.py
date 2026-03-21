@@ -1,122 +1,200 @@
 """
-Unified script ingestion — handles PDF, DOCX, XLSX, plain text, and images.
-Returns a normalized dict with lines[] and words[] for the tracker.
+Unified script ingestion.
+
+parse_unified(content, filename) does ONE pass through the document and
+returns both the word list (for STT tracking) AND the display HTML in a
+single result.  Because they're built together, line_index N in the word
+list always corresponds to data-line="N" in the HTML — no drift.
+
+PDF / image files return html=None (display is handled natively by the
+frontend: PDF.js for PDFs, <img> for images).
 """
 import io
 import re
+import html as _html
 from pathlib import Path
 
 
-def parse_script(content: bytes, filename: str) -> dict:
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def parse_unified(content: bytes, filename: str) -> dict:
+    """
+    Single-pass parse.  Returns:
+      lines       – list of plain-text lines (one per script row/paragraph)
+      words       – list of {word, clean, line_index}
+      word_count  – int
+      line_count  – int
+      html        – HTML string with data-line="N" on every block element,
+                    or None for PDF / image files
+    """
     ext = Path(filename).suffix.lower()
 
     if ext == ".pdf":
-        text = _parse_pdf(content)
-    elif ext in (".docx", ".doc"):
-        text = _parse_docx(content)
-    elif ext in (".xlsx", ".xls"):
-        text = _parse_excel(content)
-    elif ext in (".txt", ".text"):
-        text = content.decode("utf-8", errors="replace")
-    elif ext in (".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"):
-        text = _parse_image(content)
-    else:
-        # Try plain text as a last resort
-        text = content.decode("utf-8", errors="replace")
-
-    return _normalize(text)
+        return _pdf_parse(content)
+    if ext in (".docx", ".doc"):
+        return _docx_parse(content)
+    if ext in (".xlsx", ".xls"):
+        return _excel_parse(content)
+    if ext in (".txt", ".text"):
+        return _txt_parse(content)
+    if ext in (".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"):
+        return _image_parse(content)
+    # Unknown — try plain text
+    return _txt_parse(content)
 
 
-# ── Parsers ──────────────────────────────────────────────────────────────────
+# Keep parse_script as a backwards-compatible alias used by main.py
+def parse_script(content: bytes, filename: str) -> dict:
+    result = parse_unified(content, filename)
+    return result
 
-def _parse_pdf(content: bytes) -> str:
+
+# ── Per-format parsers (each does one pass, builds words + HTML together) ─────
+
+def _docx_parse(content: bytes) -> dict:
+    from docx import Document
+    lines, words, html_rows = [], [], []
+
+    doc = Document(io.BytesIO(content))
+    for child in doc.element.body:
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+
+        if tag == "p":
+            text = "".join(
+                r.text or "" for r in child.iter() if r.tag.split("}")[-1] == "t"
+            )
+            if not text.strip():
+                continue
+            line_idx = _add_line(lines, words, text)
+            html_rows.append(f'<p data-line="{line_idx}">{_h(text)}</p>')
+
+        elif tag == "tbl":
+            html_rows.append("<table>")
+            for tr in child.iter():
+                if tr.tag.split("}")[-1] != "tr":
+                    continue
+                cells, seen = [], set()
+                for tc in tr.iter():
+                    if tc.tag.split("}")[-1] != "tc":
+                        continue
+                    ct = "".join(
+                        r.text or "" for r in tc.iter() if r.tag.split("}")[-1] == "t"
+                    ).strip()
+                    if ct not in seen:
+                        cells.append(ct)
+                        seen.add(ct)
+                row_text = "\t".join(cells)
+                if not row_text.strip():
+                    continue
+                line_idx = _add_line(lines, words, row_text)
+                tds = "".join(f"<td>{_h(c)}</td>" for c in cells)
+                html_rows.append(f'<tr data-line="{line_idx}">{tds}</tr>')
+            html_rows.append("</table>")
+
+    return _result(lines, words, "\n".join(html_rows))
+
+
+def _excel_parse(content: bytes) -> dict:
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    lines, words, html_rows = [], [], []
+
+    for ws in wb.worksheets:
+        html_rows.append(f'<h3 class="sheet-name">{_h(ws.title)}</h3><table>')
+        for row in ws.iter_rows(values_only=True):
+            # Keep cells that are not None; skip rows that are entirely empty
+            cells = [c for c in row if c is not None]
+            row_text = "\t".join(str(c) for c in cells if str(c).strip())
+            if not row_text.strip():
+                continue
+            line_idx = _add_line(lines, words, row_text)
+            tds = "".join(f"<td>{_h(str(c))}</td>" for c in cells)
+            html_rows.append(f'<tr data-line="{line_idx}">{tds}</tr>')
+        html_rows.append("</table>")
+
+    return _result(lines, words, "\n".join(html_rows))
+
+
+def _txt_parse(content: bytes) -> dict:
+    lines, words, html_rows = [], [], []
+    for raw in content.decode("utf-8", errors="replace").split("\n"):
+        if not raw.strip():
+            continue
+        line_idx = _add_line(lines, words, raw)
+        html_rows.append(f'<p data-line="{line_idx}">{_h(raw)}</p>')
+    return _result(lines, words, "\n".join(html_rows))
+
+
+def _pdf_parse(content: bytes) -> dict:
     try:
         import pypdfium2 as pdfium
         pdf = pdfium.PdfDocument(content)
         pages = []
         for page in pdf:
             textpage = page.get_textpage()
-            pages.append(textpage.get_text_range())
+            pages.append(textpage.get_text_bounded())
         text = "\n".join(pages)
-        # If the PDF appears to be scanned (very little text), try OCR
         if len(text.strip()) < 100:
             text = _ocr_pdf(content)
-        return text
     except Exception as e:
         raise ValueError(f"PDF parse failed: {e}")
 
+    lines, words = [], []
+    for raw in text.split("\n"):
+        if raw.strip():
+            _add_line(lines, words, raw)
+    return _result(lines, words, None)  # HTML=None → PDF.js handles display
 
-def _ocr_pdf(content: bytes) -> str:
-    """Fallback OCR for scanned PDFs — requires poppler + tesseract."""
+
+def _image_parse(content: bytes) -> dict:
     try:
-        from pdf2image import convert_from_bytes
-        images = convert_from_bytes(content)
-        pages = [_parse_image(_img_to_bytes(img)) for img in images]
-        return "\n".join(pages)
+        from PIL import Image
+        import pytesseract
+        text = pytesseract.image_to_string(Image.open(io.BytesIO(content)))
     except Exception:
-        return ""
+        text = ""
+    lines, words = [], []
+    for raw in text.split("\n"):
+        if raw.strip():
+            _add_line(lines, words, raw)
+    return _result(lines, words, None)  # HTML=None → <img> handles display
 
 
-def _img_to_bytes(img) -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _add_line(lines: list, words: list, text: str) -> int:
+    """Append a line and its words; return the new line_index."""
+    line_idx = len(lines)
+    lines.append(text)
+    for token in re.findall(r"\S+", text):
+        words.append({
+            "word": token,
+            "clean": re.sub(r"[^\w']", "", token.lower()),
+            "line_index": line_idx,
+        })
+    return line_idx
 
 
-def _parse_docx(content: bytes) -> str:
-    from docx import Document
-    doc = Document(io.BytesIO(content))
-    return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-
-
-def _parse_excel(content: bytes) -> str:
-    from openpyxl import load_workbook
-    wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
-    lines = []
-    for ws in wb.worksheets:
-        for row in ws.iter_rows(values_only=True):
-            row_text = "  ".join(str(c) for c in row if c is not None and str(c).strip())
-            if row_text.strip():
-                lines.append(row_text)
-    return "\n".join(lines)
-
-
-def _parse_image(content: bytes) -> str:
-    from PIL import Image
-    import pytesseract
-    img = Image.open(io.BytesIO(content))
-    return pytesseract.image_to_string(img)
-
-
-# ── Normalizer ───────────────────────────────────────────────────────────────
-
-def _normalize(text: str) -> dict:
-    """
-    Break text into lines and a flat word list.
-    Each word carries its line index so the UI can scroll to the right line.
-    """
-    raw_lines = text.split("\n")
-    lines = []
-    words = []
-
-    for raw_line in raw_lines:
-        line = raw_line.strip()
-        if not line:
-            continue
-        line_idx = len(lines)
-        lines.append(line)
-
-        for token in re.findall(r"\S+", line):
-            clean = re.sub(r"[^\w']", "", token.lower())
-            words.append({
-                "word": token,
-                "clean": clean,
-                "line_index": line_idx,
-            })
-
+def _result(lines: list, words: list, html) -> dict:
     return {
         "lines": lines,
         "words": words,
         "word_count": len(words),
         "line_count": len(lines),
+        "html": html,
     }
+
+
+def _h(text: str) -> str:
+    return _html.escape(str(text))
+
+
+def _ocr_pdf(content: bytes) -> str:
+    try:
+        from pdf2image import convert_from_bytes
+        images = convert_from_bytes(content)
+        from PIL import Image
+        import pytesseract
+        return "\n".join(pytesseract.image_to_string(img) for img in images)
+    except Exception:
+        return ""

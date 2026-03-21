@@ -74,9 +74,10 @@ export default function ScriptDisplay({ script, currentLine, locked, onSeek }) {
               marginBottom: 4,
               borderRadius: 6,
               cursor: 'pointer',
-              fontFamily: "'Inter', sans-serif",
+              fontFamily: line.includes('\t') ? "'JetBrains Mono', monospace" : "'Inter', sans-serif",
               fontSize: isCurrent ? 20 : isNear ? 17 : 15,
               fontWeight: isCurrent ? 600 : 400,
+              whiteSpace: 'pre-wrap',
               color: isCurrent
                 ? '#fff'
                 : isPast

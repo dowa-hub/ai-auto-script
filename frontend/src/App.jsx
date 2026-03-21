@@ -1,13 +1,14 @@
-import { useState, useCallback, useRef } from 'react'
+import { useState, useCallback } from 'react'
 import { useAudio }        from './hooks/useAudio.js'
 import { useScriptSocket } from './hooks/useScriptSocket.js'
-import ScriptDisplay  from './components/ScriptDisplay.jsx'
+import DocumentViewer from './components/DocumentViewer.jsx'
 import AudioControls  from './components/AudioControls.jsx'
 import StatusBar      from './components/StatusBar.jsx'
 import Sidebar        from './components/Sidebar.jsx'
 
 export default function App() {
   const [script,      setScript]      = useState(null)
+  const [fileInfo,    setFileInfo]    = useState(null)  // { name } for DocumentViewer
   const [currentLine, setCurrentLine] = useState(null)
   const [confidence,  setConfidence]  = useState(0)
   const [transcript,  setTranscript]  = useState('')
@@ -24,7 +25,7 @@ export default function App() {
     }
   }, [])
 
-  const { connected, modelReady, sendChunk } = useScriptSocket(onMessage)
+  const { connected, modelReady, sttStatus, sendChunk, reconnect } = useScriptSocket(onMessage)
 
   // ── Audio ──────────────────────────────────────────────────────────────────
   const onChunk = useCallback((buffer) => {
@@ -73,6 +74,8 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(changes),
     })
+    // Reconnect WebSocket so the new STT engine/mode takes effect immediately
+    reconnect()
   }
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -92,17 +95,17 @@ export default function App() {
       {/* Main area: sidebar + script */}
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         <Sidebar
-          onScriptLoaded={setScript}
+          onScriptLoaded={(data, name) => { setScript(data); setFileInfo({ name }) }}
           sttMode={sttMode}
           whisperModel={whisperModel}
           onSettingsChange={handleSettingsChange}
+          sttStatus={sttStatus}
         />
 
-        <ScriptDisplay
-          script={script}
+        <DocumentViewer
+          fileInfo={fileInfo}
           currentLine={currentLine}
           locked={locked}
-          onSeek={handleSeek}
         />
       </div>
 
@@ -118,6 +121,7 @@ export default function App() {
         onStop={stop}
         connected={connected}
         modelReady={modelReady}
+        sttStatus={sttStatus}
       />
     </div>
   )

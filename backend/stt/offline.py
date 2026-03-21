@@ -7,7 +7,7 @@ from faster_whisper import WhisperModel
 class OfflineSTT:
     def __init__(self, model_size: str = "base.en"):
         self.model_size = model_size
-        self.model: WhisperModel | None = None
+        self.model = None  # type: WhisperModel
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.ready = False
 

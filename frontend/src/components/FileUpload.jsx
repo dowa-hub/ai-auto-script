@@ -22,7 +22,7 @@ export default function FileUpload({ onScriptLoaded }) {
       // Fetch parsed script
       const scriptRes  = await fetch('/api/script')
       const scriptData = await scriptRes.json()
-      onScriptLoaded(scriptData)
+      onScriptLoaded(scriptData, file.name)
     } catch (e) {
       setError(e.message)
     } finally {

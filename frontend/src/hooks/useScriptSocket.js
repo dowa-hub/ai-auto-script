@@ -10,6 +10,7 @@ const RECONNECT_DELAY = 2000
 export function useScriptSocket(onMessage) {
   const [connected, setConnected]   = useState(false)
   const [modelReady, setModelReady] = useState(false)
+  const [sttStatus, setSttStatus]   = useState(null)  // {engine, connected, model, error}
   const wsRef     = useRef(null)
   const reconnRef = useRef(null)
 
@@ -29,6 +30,9 @@ export function useScriptSocket(onMessage) {
         const msg = JSON.parse(e.data)
         if (msg.type === 'model_status') {
           setModelReady(msg.status === 'ready')
+        }
+        if (msg.type === 'stt_status') {
+          setSttStatus(msg)
         }
         if (typeof onMessage === 'function') onMessage(msg)
       } catch {}
@@ -57,5 +61,9 @@ export function useScriptSocket(onMessage) {
     }
   }, [])
 
-  return { connected, modelReady, sendChunk }
+  const reconnect = useCallback(() => {
+    wsRef.current?.close()
+  }, [])
+
+  return { connected, modelReady, sttStatus, sendChunk, reconnect }
 }
