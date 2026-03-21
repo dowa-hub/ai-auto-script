@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Environment
+.env
+backend/.env
+
+# Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# macOS
+.DS_Store
+
+# Hugging Face model cache (large, re-downloads automatically)
+# Uncomment if you want to exclude it from git (recommended):
+# ~/.cache/huggingface/
+
+# Logs
+*.log
