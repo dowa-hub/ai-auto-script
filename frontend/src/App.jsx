@@ -18,10 +18,12 @@ export default function App() {
 
   // ── WebSocket ──────────────────────────────────────────────────────────────
   const onMessage = useCallback((msg) => {
+    if (msg.type === 'transcript') {
+      setTranscript(msg.text)
+    }
     if (msg.type === 'position') {
       setCurrentLine(msg.line_index)
       setConfidence(msg.confidence)
-      setTranscript(msg.transcript || '')
     }
   }, [])
 
@@ -106,6 +108,7 @@ export default function App() {
           fileInfo={fileInfo}
           currentLine={currentLine}
           locked={locked}
+          scriptData={script}
         />
       </div>
 

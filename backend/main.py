@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, HTMLResponse
 
 from ingestion.parser import parse_unified
-from tracker import ScriptTracker, MIN_CONFIDENCE  # noqa: F401
+from tracker import ScriptTracker
 from stt.offline import OfflineSTT
 from stt.cloud import CloudSTT
 
@@ -52,6 +52,7 @@ current_file_bytes = None   # raw uploaded file bytes
 current_file_name = None    # original filename
 current_html = None         # pre-built display HTML (same line numbering as word list)
 model_ready = False
+_init_task = None           # background startup task — cancelled on settings change
 
 
 async def build_stt(mode: str, status_cb=None):
@@ -66,9 +67,9 @@ async def build_stt(mode: str, status_cb=None):
 
 @app.on_event("startup")
 async def startup():
-    global stt_engine, model_ready
-    # Load model in the background so the server starts immediately
-    asyncio.create_task(_init_stt_background())
+    global _init_task
+    _load_script_cache()  # restore last uploaded script
+    _init_task = asyncio.create_task(_init_stt_background())
 
 
 async def _init_stt_background():
@@ -81,6 +82,36 @@ async def _init_stt_background():
 
 
 # ── REST endpoints ─────────────────────────────────────────────────────────────
+
+_CACHE_DIR = Path(__file__).parent / ".cache"
+_CACHE_DIR.mkdir(exist_ok=True)
+
+
+def _save_script_cache(content: bytes, filename: str):
+    """Persist uploaded script to disk so it survives server restarts."""
+    (Path(_CACHE_DIR) / "last_script").write_bytes(content)
+    (Path(_CACHE_DIR) / "last_script_name").write_text(filename)
+
+
+def _load_script_cache():
+    """Reload last uploaded script from disk cache."""
+    global current_script, tracker, current_file_bytes, current_file_name, current_html
+    cache_file = _CACHE_DIR / "last_script"
+    name_file = _CACHE_DIR / "last_script_name"
+    if cache_file.exists() and name_file.exists():
+        content = cache_file.read_bytes()
+        filename = name_file.read_text().strip()
+        try:
+            data = parse_unified(content, filename)
+            current_script = data
+            current_file_bytes = content
+            current_file_name = filename
+            current_html = data.get("html")
+            tracker = ScriptTracker(data["words"])
+            print(f"[Cache] Restored script '{filename}': {data['word_count']} words")
+        except Exception as e:
+            print(f"[Cache] Failed to restore script: {e}")
+
 
 @app.post("/api/upload-script")
 async def upload_script(file: UploadFile = File(...)):
@@ -96,6 +127,7 @@ async def upload_script(file: UploadFile = File(...)):
     current_file_name = file.filename
     current_html = data.get("html")   # None for PDF/image — frontend handles those natively
     tracker = ScriptTracker(data["words"])
+    _save_script_cache(content, file.filename)
     return {
         "ok": True,
         "lines": data["line_count"],
@@ -137,7 +169,10 @@ async def get_status():
 
 @app.post("/api/settings")
 async def update_settings(body: dict):
-    global stt_engine, model_ready, STT_MODE, WHISPER_MODEL, DEEPGRAM_KEY
+    global stt_engine, model_ready, STT_MODE, WHISPER_MODEL, DEEPGRAM_KEY, _init_task
+    # Cancel the background startup task so it can't overwrite our new engine
+    if _init_task and not _init_task.done():
+        _init_task.cancel()
     if "stt_mode" in body:
         STT_MODE = body["stt_mode"]
     if "whisper_model" in body:
@@ -190,28 +225,42 @@ async def audio_ws(websocket: WebSocket):
             pass
 
     async def dispatch(transcript: str):
-        """Update tracker and push position to frontend."""
-        if not transcript or not tracker or not current_script:
+        """Push live transcript and, if a script is loaded, update tracker position."""
+        if not transcript:
             return
+        # Always show what was heard
+        await send({"type": "transcript", "text": transcript})
+        if not tracker or not current_script:
+            return
+
+        old_pos = tracker.position
         position, confidence = tracker.update(transcript)
-        current_line = current_script["words"][position]["line_index"]
-        await send({
-            "type":       "position",
-            "word_index": position,
-            "line_index": current_line,
-            "confidence": round(confidence, 2),
-            "transcript": transcript,
-        })
-        if confidence < MIN_CONFIDENCE and not tracker.locked:
-            asyncio.create_task(_claude_fallback(send, transcript))
+
+        # LOG every tracker decision to terminal
+        if confidence > 0:
+            current_line = current_script["words"][position]["line_index"]
+            ctx_s = max(0, position - 2)
+            ctx_e = min(len(current_script["words"]), position + 6)
+            ctx = " ".join(current_script["words"][j]["word"] for j in range(ctx_s, ctx_e))
+            from tracker import log as tlog
+            tlog.debug(f"[TRACK] \"{transcript}\" → pos={old_pos}→{position} line={current_line} conf={confidence:.2f} buf={tracker._buffer[-5:]}")
+            tlog.debug(f"        script: ...{ctx}...")
+            await send({
+                "type":       "position",
+                "word_index": position,
+                "line_index": current_line,
+                "confidence": round(confidence, 2),
+                "transcript": transcript,
+            })
+        else:
+            from tracker import log as tlog
+            tlog.debug(f"[MISS]  \"{transcript}\" → pos stays {position}, buf={tracker._buffer[-5:]}")
 
     async def run_offline():
         """Transcribe from buffer and dispatch. Runs in background task."""
         nonlocal is_transcribing
         try:
-            # Use longer clip in scan mode for better initial lock-on accuracy
-            n = SCAN_CHUNKS if tracker and tracker._mode == 'scan' else CONTEXT_CHUNKS
-            context    = np.concatenate(audio_buffer[-n:])
+            context    = np.concatenate(audio_buffer[-CONTEXT_CHUNKS:])
             transcript = await stt_engine.transcribe(context)
             if transcript:
                 await dispatch(transcript)
@@ -245,15 +294,20 @@ async def audio_ws(websocket: WebSocket):
             if len(audio_buffer) > MAX_BUFFER_CHUNKS:
                 audio_buffer.pop(0)
 
-            if not model_ready or not stt_engine or not tracker:
+            if not model_ready or not stt_engine:
                 continue
 
             if is_cloud:
                 # ── Cloud path: pipe every chunk to Deepgram, get transcripts back ──
                 await stt_engine.send_chunk(chunk)
-                transcript = stt_engine.pop_transcript()
-                if transcript:
-                    await dispatch(transcript)
+                # Show interim (partial) results live
+                interim = stt_engine.peek_interim()
+                if interim:
+                    await send({"type": "transcript", "text": interim})
+                # Feed final words to the tracker
+                final = stt_engine.pop_transcript()
+                if final:
+                    await dispatch(final)
 
             else:
                 # ── Offline path: batch every N chunks, skip if already running ──

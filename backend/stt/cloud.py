@@ -32,9 +32,11 @@ class CloudSTT:
         self.api_key  = api_key
         self.ready    = bool(api_key)
         self._ws      = None
-        self._pending = []          # transcripts waiting to be popped
-        self._lock    = asyncio.Lock()
-        self._task    = None
+        self._pending           = []    # final transcripts for position tracking
+        self._interim_text      = ""    # latest partial result for live display
+        self._lock              = asyncio.Lock()
+        self._task              = None
+        self._keepalive_task    = None
 
     async def initialize(self, status_callback=None):
         if not self.api_key:
@@ -49,7 +51,18 @@ class CloudSTT:
         headers = {"Authorization": f"Token {self.api_key}"}
         ssl_ctx = ssl.create_default_context(cafile=certifi.where())
         self._ws = await websockets.connect(DEEPGRAM_URL, extra_headers=headers, ssl=ssl_ctx)
-        self._task = asyncio.create_task(self._receive_loop())
+        self._task           = asyncio.create_task(self._receive_loop())
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+
+    async def _keepalive_loop(self):
+        """Send a KeepAlive ping every 8s so Deepgram doesn't close idle connections."""
+        try:
+            while True:
+                await asyncio.sleep(8)
+                if self._ws and not self._ws.closed:
+                    await self._ws.send('{"type": "KeepAlive"}')
+        except Exception:
+            pass
 
     async def _receive_loop(self):
         """Background task — reads transcripts from Deepgram as they arrive."""
@@ -64,30 +77,41 @@ class CloudSTT:
                     .get("transcript", "")
                     .strip()
                 )
-                if text:
-                    async with self._lock:
+                if not text:
+                    continue
+                is_final = data.get("is_final", False)
+                async with self._lock:
+                    if is_final:
                         self._pending.append(text)
+                        self._interim_text = ""
+                    else:
+                        self._interim_text = text
         except Exception:
             pass
 
     async def send_chunk(self, audio_int16: np.ndarray):
         """Pipe a raw PCM int16 chunk straight to Deepgram."""
-        if self._ws and self._ws.close_code is None:
+        if self._ws and not self._ws.closed:
             try:
                 await self._ws.send(audio_int16.tobytes())
             except Exception:
                 pass
 
     def pop_transcript(self) -> str:
-        """Non-blocking drain — returns all pending transcripts joined, or empty string."""
+        """Non-blocking drain — returns final transcripts for position tracking."""
         if not self._pending:
             return ""
-        # Grab everything accumulated since last pop
         items = self._pending[:]
         self._pending.clear()
         return " ".join(items)
 
+    def peek_interim(self) -> str:
+        """Return the latest partial transcript for live display (non-destructive)."""
+        return self._interim_text
+
     async def close(self):
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
         if self._task:
             self._task.cancel()
         if self._ws:

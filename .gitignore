@@ -24,3 +24,6 @@ frontend/.vite/
 
 # Logs
 *.log
+# Cache files
+backend/.cache/
+backend/tracker.log

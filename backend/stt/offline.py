@@ -44,6 +44,9 @@ class OfflineSTT:
         )
         return result
 
+    async def close(self):
+        pass  # nothing to close for offline STT
+
     def _run_transcription(self, audio: np.ndarray) -> str:
         segments, _ = self.model.transcribe(
             audio,

@@ -24,11 +24,12 @@ async function getPdfjs() {
 const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'tiff', 'tif', 'bmp', 'webp'])
 const HTML_EXTS  = new Set(['docx', 'doc', 'xlsx', 'xls', 'txt', 'text'])
 
-export default function DocumentViewer({ fileInfo, currentLine, locked }) {
+export default function DocumentViewer({ fileInfo, currentLine, locked, scriptData }) {
   const scrollRef   = useRef(null)   // outer scrollable div
   const innerRef    = useRef(null)   // inner div — PDF pages rendered here
   const highlightRef = useRef(null)  // amber bar (PDF mode, absolutely positioned)
   const pdfLinesRef = useRef([])     // [{yTop, yBottom}] in innerRef coords, per script line
+  const pdfTextRowsRef = useRef([])  // [{text, yTop, yBot}] — all text rows with positions
 
   const [mode, setMode]           = useState(null)  // 'pdf' | 'html' | 'image' | null
   const [htmlContent, setHtml]    = useState('')
@@ -73,7 +74,7 @@ export default function DocumentViewer({ fileInfo, currentLine, locked }) {
   // ── Respond to tracker position updates ───────────────────────────────────
   useEffect(() => {
     if (currentLine == null) return
-    if (mode === 'pdf')  highlightPdf(currentLine)
+    if (mode === 'pdf')  highlightPdfByText(currentLine)
     if (mode === 'html') highlightHtml(currentLine)
   }, [currentLine, mode])
 
@@ -89,6 +90,7 @@ export default function DocumentViewer({ fileInfo, currentLine, locked }) {
     const GAP = 20
     let topOffset = 0
     const allLines = []
+    const allTextRows = []
 
     for (let p = 1; p <= pdf.numPages; p++) {
       const page     = await pdf.getPage(p)
@@ -117,7 +119,7 @@ export default function DocumentViewer({ fileInfo, currentLine, locked }) {
       wrap.appendChild(canvas)
       inner.appendChild(wrap)
 
-      // Build line map from text layer
+      // Build line map from text layer — store text + positions
       const tc = await page.getTextContent()
       const buckets = new Map()
 
@@ -129,25 +131,33 @@ export default function DocumentViewer({ fileInfo, currentLine, locked }) {
         const yBot   = vy + 2
         const key    = Math.round(vy / 10) * 10  // ~10px buckets = one visual line
         if (!buckets.has(key)) {
-          buckets.set(key, { yTop, yBot })
+          buckets.set(key, { yTop, yBot, texts: [item.str.trim()] })
         } else {
           const b = buckets.get(key)
           b.yTop = Math.min(b.yTop, yTop)
           b.yBot = Math.max(b.yBot, yBot)
+          b.texts.push(item.str.trim())
         }
       }
 
       // Sort top → bottom, push to global line list with page offset
       ;[...buckets.entries()]
         .sort((a, b) => a[0] - b[0])
-        .forEach(([, { yTop, yBot }]) => {
-          allLines.push({ yTop: topOffset + yTop, yBot: topOffset + yBot })
+        .forEach(([, { yTop, yBot, texts }]) => {
+          const row = {
+            yTop: topOffset + yTop,
+            yBot: topOffset + yBot,
+            text: texts.join(' ').toLowerCase().replace(/[^\w\s']/g, ''),
+          }
+          allLines.push(row)
+          allTextRows.push(row)
         })
 
       topOffset += viewport.height + GAP
     }
 
     pdfLinesRef.current = allLines
+    pdfTextRowsRef.current = allTextRows
 
     // Amber highlight bar — absolutely positioned inside inner
     const bar = document.createElement('div')
@@ -165,23 +175,52 @@ export default function DocumentViewer({ fileInfo, currentLine, locked }) {
     highlightRef.current = bar
   }
 
-  function highlightPdf(lineIdx) {
-    const lines = pdfLinesRef.current
-    const bar   = highlightRef.current
-    if (!bar || !lines.length) return
+  function highlightPdfByText(lineIdx) {
+    const rows = pdfTextRowsRef.current
+    const bar  = highlightRef.current
+    if (!bar || !rows.length) return
 
-    // Clamp to available lines
-    const entry = lines[Math.min(lineIdx, lines.length - 1)]
-    if (!entry) return
+    // Get the script text for this line from scriptData
+    let searchText = ''
+    if (scriptData?.lines?.[lineIdx]) {
+      searchText = scriptData.lines[lineIdx].toLowerCase().replace(/[^\w\s']/g, '')
+    }
+
+    // Find the PDF row that best matches this script line text
+    let bestRow = null
+    let bestScore = 0
+
+    if (searchText && searchText.length > 5) {
+      // Extract distinctive words (4+ chars) from the script line
+      const searchWords = searchText.split(/\s+/).filter(w => w.length >= 4)
+      for (const row of rows) {
+        let matches = 0
+        for (const sw of searchWords) {
+          if (row.text.includes(sw)) matches++
+        }
+        const score = searchWords.length > 0 ? matches / searchWords.length : 0
+        if (score > bestScore) {
+          bestScore = score
+          bestRow = row
+        }
+      }
+    }
+
+    // Fallback: use old index-based approach if text search fails
+    if (!bestRow || bestScore < 0.3) {
+      bestRow = rows[Math.min(lineIdx, rows.length - 1)]
+    }
+
+    if (!bestRow) return
 
     bar.style.opacity = '1'
-    bar.style.top     = entry.yTop + 'px'
-    bar.style.height  = (entry.yBot - entry.yTop + 6) + 'px'
+    bar.style.top     = bestRow.yTop + 'px'
+    bar.style.height  = (bestRow.yBot - bestRow.yTop + 6) + 'px'
 
     // Scroll to center this line
     const sc = scrollRef.current
     if (sc) {
-      const target = entry.yTop - sc.clientHeight / 2 + (entry.yBot - entry.yTop) / 2
+      const target = bestRow.yTop - sc.clientHeight / 2 + (bestRow.yBot - bestRow.yTop) / 2
       sc.scrollTo({ top: Math.max(0, target), behavior: 'smooth' })
     }
   }
