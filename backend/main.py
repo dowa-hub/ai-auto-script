@@ -238,9 +238,9 @@ async def audio_ws(websocket: WebSocket):
 
         # LOG every tracker decision to terminal
         if confidence > 0:
-            # Compensate for STT + processing latency: advance position ~8 words
+            # Compensate for STT + processing latency: advance position ~3 words
             # so the highlight shows where the speaker IS, not where they WERE
-            lookahead = min(position + 8, len(current_script["words"]) - 1)
+            lookahead = min(position + 3, len(current_script["words"]) - 1)
             display_line = current_script["words"][lookahead]["line_index"]
             current_line = current_script["words"][position]["line_index"]
             ctx_s = max(0, position - 2)
