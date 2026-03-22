@@ -24,6 +24,26 @@ async function getPdfjs() {
 const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'tiff', 'tif', 'bmp', 'webp'])
 const HTML_EXTS  = new Set(['docx', 'doc', 'xlsx', 'xls', 'txt', 'text'])
 
+// Slow, steady scroll animation (easeInOutCubic) so the reader can follow along
+let _scrollRaf = null
+function smoothScrollTo(element, targetY, duration = 800) {
+  if (_scrollRaf) cancelAnimationFrame(_scrollRaf)
+  const startY = element.scrollTop
+  const diff = targetY - startY
+  if (Math.abs(diff) < 5) return  // already there
+  const startTime = performance.now()
+
+  function step(now) {
+    const elapsed = now - startTime
+    const t = Math.min(elapsed / duration, 1)
+    // easeInOutCubic — smooth acceleration and deceleration
+    const ease = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2
+    element.scrollTop = startY + diff * ease
+    if (t < 1) _scrollRaf = requestAnimationFrame(step)
+  }
+  _scrollRaf = requestAnimationFrame(step)
+}
+
 export default function DocumentViewer({ fileInfo, currentLine, locked, scriptData }) {
   const scrollRef   = useRef(null)   // outer scrollable div
   const innerRef    = useRef(null)   // inner div — PDF pages rendered here
@@ -266,11 +286,12 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
     bar.style.top     = entry.yTop + 'px'
     bar.style.height  = (entry.yBot - entry.yTop + 6) + 'px'
 
-    // Scroll to center this line
+    // Scroll so highlight sits ~20% from top — leaves plenty of script visible below
+    // Uses slow animated scroll so the reader's eyes can follow along
     const sc = scrollRef.current
     if (sc) {
-      const target = entry.yTop - sc.clientHeight / 2 + (entry.yBot - entry.yTop) / 2
-      sc.scrollTo({ top: Math.max(0, target), behavior: 'smooth' })
+      const target = Math.max(0, entry.yTop - sc.clientHeight * 0.2)
+      smoothScrollTo(sc, target, 800)  // 800ms duration
     }
   }
 
@@ -282,7 +303,7 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
     const el = sc.querySelector(`[data-line="${lineIdx}"]`)
     if (!el) return
     el.classList.add('ais-current')
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }
 
   // ── Render ─────────────────────────────────────────────────────────────────
