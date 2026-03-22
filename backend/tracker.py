@@ -236,12 +236,9 @@ class ScriptTracker:
                 self._miss_count = 0
                 return self.position, conf
 
-        # No match in window — try full-script rescan
-        self._miss_count += 1
-        if len(self._buffer) >= 3 and (
-            self._miss_count >= RELOCATE_AFTER or  # sustained misses
-            self.position == 0                      # never matched yet
-        ):
+        # No match in window — immediately try full-script rescan
+        # (trigram hash lookups are O(1), no reason to wait)
+        if len(self._buffer) >= 3:
             return self._full_rescan()
 
         return self.position, 0.0

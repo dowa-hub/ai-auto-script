@@ -30,6 +30,7 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
   const highlightRef = useRef(null)  // amber bar (PDF mode, absolutely positioned)
   const pdfLinesRef = useRef([])     // [{yTop, yBottom}] in innerRef coords, per script line
   const pdfTextRowsRef = useRef([])  // [{text, yTop, yBot}] — all text rows with positions
+  const lineToPdfRow = useRef({})   // backend line_index → PDF row index (built once at load)
 
   const [mode, setMode]           = useState(null)  // 'pdf' | 'html' | 'image' | null
   const [htmlContent, setHtml]    = useState('')
@@ -70,6 +71,13 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
       setLoading(false)
     }
   }
+
+  // ── Rebuild PDF line mapping when scriptData arrives ──────────────────────
+  useEffect(() => {
+    if (mode === 'pdf' && scriptData?.lines && pdfTextRowsRef.current.length) {
+      buildLineMapping(pdfTextRowsRef.current)
+    }
+  }, [scriptData, mode])
 
   // ── Respond to tracker position updates ───────────────────────────────────
   useEffect(() => {
@@ -159,6 +167,10 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
     pdfLinesRef.current = allLines
     pdfTextRowsRef.current = allTextRows
 
+    // Build a mapping from backend line_index → PDF row index
+    // by matching words sequentially between both sides
+    buildLineMapping(allTextRows)
+
     // Amber highlight bar — absolutely positioned inside inner
     const bar = document.createElement('div')
     bar.style.cssText = [
@@ -175,52 +187,89 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
     highlightRef.current = bar
   }
 
+  function buildLineMapping(pdfRows) {
+    // Build a one-time mapping: backend line_index → PDF row index
+    // Strategy: concatenate all PDF row words and all backend words,
+    // then walk through both sequences matching words to link lines to rows.
+    if (!scriptData?.lines || !pdfRows.length) return
+
+    const mapping = {}
+    const pdfWords = []  // [{rowIdx, word}]
+    for (let r = 0; r < pdfRows.length; r++) {
+      const words = pdfRows[r].text.split(/\s+/).filter(w => w.length > 0)
+      for (const w of words) {
+        pdfWords.push({ rowIdx: r, word: w })
+      }
+    }
+
+    const backendWords = [] // [{lineIdx, word}]
+    for (let l = 0; l < scriptData.lines.length; l++) {
+      const cleaned = scriptData.lines[l].toLowerCase().replace(/[^\w\s']/g, '')
+      const words = cleaned.split(/\s+/).filter(w => w.length > 0)
+      for (const w of words) {
+        backendWords.push({ lineIdx: l, word: w })
+      }
+    }
+
+    // Walk both word sequences, matching words to build the line→row mapping
+    let pi = 0  // pdf word pointer
+    for (let bi = 0; bi < backendWords.length && pi < pdfWords.length; bi++) {
+      const bw = backendWords[bi]
+      // Search ahead in PDF words for a match (allow some skips for OCR differences)
+      const searchLimit = Math.min(pi + 15, pdfWords.length)
+      for (let j = pi; j < searchLimit; j++) {
+        if (pdfWords[j].word === bw.word ||
+            (bw.word.length >= 4 && pdfWords[j].word.length >= 4 && bw.word.slice(0, 4) === pdfWords[j].word.slice(0, 4))) {
+          // Match found — record the line→row mapping (first occurrence wins)
+          if (!(bw.lineIdx in mapping)) {
+            mapping[bw.lineIdx] = pdfWords[j].rowIdx
+          }
+          pi = j + 1
+          break
+        }
+      }
+    }
+
+    lineToPdfRow.current = mapping
+    console.log(`[PDF] Built line mapping: ${Object.keys(mapping).length} backend lines → PDF rows`)
+  }
+
   function highlightPdfByText(lineIdx) {
     const rows = pdfTextRowsRef.current
     const bar  = highlightRef.current
     if (!bar || !rows.length) return
 
-    // Get the script text for this line from scriptData
-    let searchText = ''
-    if (scriptData?.lines?.[lineIdx]) {
-      searchText = scriptData.lines[lineIdx].toLowerCase().replace(/[^\w\s']/g, '')
-    }
+    // Use the pre-built mapping to find the correct PDF row
+    const mapping = lineToPdfRow.current
+    let rowIdx = mapping[lineIdx]
 
-    // Find the PDF row that best matches this script line text
-    let bestRow = null
-    let bestScore = 0
-
-    if (searchText && searchText.length > 5) {
-      // Extract distinctive words (4+ chars) from the script line
-      const searchWords = searchText.split(/\s+/).filter(w => w.length >= 4)
-      for (const row of rows) {
-        let matches = 0
-        for (const sw of searchWords) {
-          if (row.text.includes(sw)) matches++
-        }
-        const score = searchWords.length > 0 ? matches / searchWords.length : 0
-        if (score > bestScore) {
-          bestScore = score
-          bestRow = row
+    // If exact line not mapped, find nearest mapped line
+    if (rowIdx == null) {
+      let closest = null
+      let closestDist = Infinity
+      for (const [lineStr, rIdx] of Object.entries(mapping)) {
+        const dist = Math.abs(parseInt(lineStr) - lineIdx)
+        if (dist < closestDist) {
+          closestDist = dist
+          closest = rIdx
         }
       }
+      if (closest != null) rowIdx = closest
     }
 
-    // Fallback: use old index-based approach if text search fails
-    if (!bestRow || bestScore < 0.3) {
-      bestRow = rows[Math.min(lineIdx, rows.length - 1)]
-    }
+    if (rowIdx == null) rowIdx = Math.min(lineIdx, rows.length - 1)
 
-    if (!bestRow) return
+    const entry = rows[rowIdx]
+    if (!entry) return
 
     bar.style.opacity = '1'
-    bar.style.top     = bestRow.yTop + 'px'
-    bar.style.height  = (bestRow.yBot - bestRow.yTop + 6) + 'px'
+    bar.style.top     = entry.yTop + 'px'
+    bar.style.height  = (entry.yBot - entry.yTop + 6) + 'px'
 
     // Scroll to center this line
     const sc = scrollRef.current
     if (sc) {
-      const target = bestRow.yTop - sc.clientHeight / 2 + (bestRow.yBot - bestRow.yTop) / 2
+      const target = entry.yTop - sc.clientHeight / 2 + (entry.yBot - entry.yTop) / 2
       sc.scrollTo({ top: Math.max(0, target), behavior: 'smooth' })
     }
   }

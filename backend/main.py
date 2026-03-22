@@ -238,17 +238,21 @@ async def audio_ws(websocket: WebSocket):
 
         # LOG every tracker decision to terminal
         if confidence > 0:
+            # Compensate for STT + processing latency: advance position ~8 words
+            # so the highlight shows where the speaker IS, not where they WERE
+            lookahead = min(position + 8, len(current_script["words"]) - 1)
+            display_line = current_script["words"][lookahead]["line_index"]
             current_line = current_script["words"][position]["line_index"]
             ctx_s = max(0, position - 2)
             ctx_e = min(len(current_script["words"]), position + 6)
             ctx = " ".join(current_script["words"][j]["word"] for j in range(ctx_s, ctx_e))
             from tracker import log as tlog
-            tlog.debug(f"[TRACK] \"{transcript}\" → pos={old_pos}→{position} line={current_line} conf={confidence:.2f} buf={tracker._buffer[-5:]}")
+            tlog.debug(f"[TRACK] \"{transcript}\" → pos={old_pos}→{position} line={current_line}→display={display_line} conf={confidence:.2f} buf={tracker._buffer[-5:]}")
             tlog.debug(f"        script: ...{ctx}...")
             await send({
                 "type":       "position",
-                "word_index": position,
-                "line_index": current_line,
+                "word_index": lookahead,
+                "line_index": display_line,
                 "confidence": round(confidence, 2),
                 "transcript": transcript,
             })
