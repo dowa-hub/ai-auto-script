@@ -129,10 +129,23 @@ def _pdf_parse(content: bytes) -> dict:
     try:
         import pypdfium2 as pdfium
         pdf = pdfium.PdfDocument(content)
+
+        # Detect "Script" column boundaries for table-based PDFs
+        script_col = _detect_script_column(pdf)
+
         pages = []
         for page in pdf:
             textpage = page.get_textpage()
-            pages.append(textpage.get_text_bounded())
+            if script_col:
+                left, right = script_col
+                text = textpage.get_text_bounded(
+                    left=left, bottom=0,
+                    right=right, top=page.get_height(),
+                )
+            else:
+                text = textpage.get_text_bounded()
+            pages.append(text)
+
         text = "\n".join(pages)
         if len(text.strip()) < 100:
             text = _ocr_pdf(content)
@@ -144,6 +157,78 @@ def _pdf_parse(content: bytes) -> dict:
         if raw.strip():
             _add_line(lines, words, raw)
     return _result(lines, words, None)  # HTML=None → PDF.js handles display
+
+
+def _detect_script_column(pdf):
+    """Detect the 'Script' column boundaries in a table-formatted PDF.
+
+    Looks for column header row (Time | Script | Virtual Cues | ...) and uses
+    the header x-positions to determine the Script column's left/right bounds.
+
+    Returns (left_x, right_x) in PDF coordinates, or None if no table detected.
+    Falls back gracefully so non-table PDFs are unaffected.
+    """
+    try:
+        # Scan first few pages to find column headers
+        for page_idx in range(min(len(pdf), 3)):
+            page = pdf[page_idx]
+            tp = page.get_textpage()
+            n = tp.count_chars()
+            if n == 0:
+                continue
+
+            limit = min(n, 3000)
+            chars = []
+            for i in range(limit):
+                c = tp.get_text_range(i, 1)
+                try:
+                    box = tp.get_charbox(i)   # (left, bottom, right, top)
+                    chars.append((c, box[0]))  # char, x_left
+                except Exception:
+                    chars.append((c, 0))
+
+            full = "".join(c for c, _ in chars)
+
+            # Find column headers — we need "Time" and "Virtual" at minimum
+            headers = {}
+            for hdr in ["Time", "Virtual", "Projection"]:
+                # Search for each header, picking the occurrence with lowest x
+                # (to avoid matching body text like "Time:" in a script line)
+                idx = 0
+                best_x = None
+                while True:
+                    found = full.find(hdr, idx)
+                    if found < 0:
+                        break
+                    x = chars[found][1]
+                    if best_x is None or x < best_x:
+                        best_x = x
+                        headers[hdr] = x
+                    idx = found + len(hdr)
+
+            if "Time" not in headers:
+                continue
+
+            # Script column: starts after "Time" header, ends at "Virtual" or "Projection"
+            # Time column is narrow (~40-80px), Script body starts at ~80-100
+            time_x = headers["Time"]
+            # Script left = Time position + generous offset to clear the Time column
+            script_left = time_x + 40
+
+            # Script right = start of Virtual Cues or Projection column
+            script_right = None
+            for col in ["Virtual", "Projection"]:
+                if col in headers:
+                    script_right = headers[col]
+                    break
+
+            if script_right and script_right > script_left:
+                print(f"[PDF] Detected Script column: x={script_left:.0f} → {script_right:.0f}")
+                return (script_left, script_right)
+
+        return None
+    except Exception:
+        return None
 
 
 def _image_parse(content: bytes) -> dict:
