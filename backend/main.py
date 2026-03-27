@@ -205,6 +205,13 @@ async def audio_ws(websocket: WebSocket):
         old_pos = tracker.position
         position, confidence = tracker.update(transcript)
 
+        # Don't move the cursor on weak matches — hold position and keep waiting
+        MIN_CONFIDENCE = 0.60
+        if 0 < confidence < MIN_CONFIDENCE:
+            from tracker import log as tlog
+            tlog.debug(f"[SKIP]  \"{transcript}\" → conf={confidence:.2f} below threshold, pos stays {position}")
+            return
+
         # LOG every tracker decision to terminal
         if confidence > 0:
             # Compensate for STT + processing latency: advance position ~3 words

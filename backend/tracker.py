@@ -185,10 +185,21 @@ class ScriptTracker:
                 break
 
         if best_pos is not None:
-            log.debug(f"[RESCAN] trigram {matched_tg} → pos {best_pos}, buffer={self._buffer}")
+            jump = abs(best_pos - self.position)
+            # Penalise confidence for large jumps — a 2000-word leap is not 80% confident
+            if jump > 500:
+                conf = 0.45
+            elif jump > 100:
+                conf = 0.60
+            else:
+                conf = 0.80
+            log.debug(f"[RESCAN] trigram {matched_tg} → pos {best_pos} (jump={jump}, conf={conf}), buffer={self._buffer}")
             self.position = best_pos
             self._miss_count = 0
-            return self.position, 0.80
+            # Discard stale off-script words — keep only the matched trigram so
+            # future updates start clean rather than re-matching old content.
+            self._buffer = list(matched_tg)
+            return self.position, conf
 
         # Trigram not found — try bigrams across full script
         for i in range(len(self._buffer) - 1):
@@ -197,10 +208,13 @@ class ScriptTracker:
                 continue
             positions = self._bigrams.get(bg, [])
             if positions:
+                jump = abs(positions[0] + 1 - self.position)
+                conf = 0.40 if jump > 100 else 0.60
                 best_pos = positions[0] + 1
                 self.position = best_pos
                 self._miss_count = 0
-                return self.position, 0.60
+                self._buffer = list(bg)
+                return self.position, conf
 
         return self.position, 0.0
 
@@ -236,9 +250,11 @@ class ScriptTracker:
                 self._miss_count = 0
                 return self.position, conf
 
-        # No match in window — immediately try full-script rescan
-        # (trigram hash lookups are O(1), no reason to wait)
-        if len(self._buffer) >= 3:
+        # No match in window — increment miss counter and hold position
+        # Only rescan after RELOCATE_AFTER consecutive misses so off-script
+        # speech doesn't cause the cursor to jump around.
+        self._miss_count += 1
+        if self._miss_count >= RELOCATE_AFTER and len(self._buffer) >= 3:
             return self._full_rescan()
 
         return self.position, 0.0
