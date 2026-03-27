@@ -1,5 +1,5 @@
 """
-Script position tracker — Constrained N-gram matching.
+Script position tracker — Constrained N-gram matching + Semantic Zone Recovery.
 
 Based on research into professional teleprompter algorithms (PromptSmart,
 Autoscript Voice, CuePrompter). Instead of Smith-Waterman alignment, uses
@@ -14,8 +14,10 @@ Algorithm layers (tried in order):
   2. Trigram fuzzy match (allows 1 STT error in the trigram)
   3. Bigram exact match near cursor
   4. Rare unigram match (IDF > threshold)
-  5. No match — cursor stays put
-  6. After sustained misses — full-script trigram scan to relocate
+  5. No match — cursor stays put, miss counter increments
+  6. After RELOCATE_AFTER misses — full-script trigram/bigram scan
+  7. After ZONE_MISS_THRESHOLD misses + n-gram scan fails — semantic zone
+     match using IDF keyword fingerprints (handles off-script speech)
 """
 import os
 import re
@@ -36,7 +38,13 @@ log.setLevel(logging.DEBUG)
 # ── Cursor movement bounds (in words) ────────────────────────────────────────
 MAX_FORWARD  = 40    # max words cursor can jump forward per update
 MAX_BACK     = 5     # max words cursor can move backward (for repeats)
-RELOCATE_AFTER = 8   # consecutive misses before full-script rescan
+RELOCATE_AFTER = 8   # consecutive misses before full-script n-gram rescan
+
+# ── Semantic zone recovery ────────────────────────────────────────────────────
+ZONE_SIZE           = 80   # words per zone
+ZONE_TOP_KEYWORDS   = 12   # top IDF keywords stored per zone fingerprint
+ZONE_BUFFER_SIZE    = 50   # recent words kept for zone scoring
+ZONE_MISS_THRESHOLD = 16   # misses before attempting zone match (after n-gram fails)
 
 # ── Stop words (ignored for unigram matching, still used in n-grams) ─────────
 STOP_WORDS = frozenset({
@@ -73,7 +81,8 @@ class ScriptTracker:
         self.position = 0
         self.locked = False
         self._script = [_clean(w["word"]) for w in words]
-        self._buffer = []       # rolling buffer of recent STT words
+        self._buffer = []       # rolling buffer of recent STT words (n-gram matching)
+        self._zone_buffer = []  # wider buffer for semantic zone scoring
         self._miss_count = 0    # consecutive updates with no match
 
         # Pre-build n-gram indices: n-gram → [positions]
@@ -89,6 +98,9 @@ class ScriptTracker:
         # IDF for rare-word detection
         self._idf = self._build_idf()
 
+        # Zone fingerprints for semantic recovery
+        self._zones = self._build_zones()
+
     def _build_idf(self) -> dict:
         counts = Counter(self._script)
         n = len(self._script)
@@ -99,6 +111,73 @@ class ScriptTracker:
             else:
                 idf[word] = max(0.5, min(5.0, math.log(max(1, n) / max(1, count))))
         return idf
+
+    def _build_zones(self) -> list:
+        """Divide the script into zones and fingerprint each with top IDF keywords.
+
+        Each zone is a tuple of (start_word_idx, end_word_idx, keyword_set).
+        Keywords are the most distinctive words in that zone by IDF score,
+        weighted by how often they appear within the zone itself.
+        """
+        zones = []
+        for start in range(0, len(self._script), ZONE_SIZE):
+            end = min(start + ZONE_SIZE, len(self._script))
+            zone_words = self._script[start:end]
+            # Score each word: idf * frequency within zone
+            scored = {}
+            for w in zone_words:
+                if w in STOP_WORDS or not w:
+                    continue
+                idf = self._idf.get(w, 0)
+                if idf > 0:
+                    scored[w] = scored.get(w, 0) + idf
+            top = sorted(scored.items(), key=lambda x: -x[1])[:ZONE_TOP_KEYWORDS]
+            keywords = {w for w, _ in top}
+            zones.append((start, end, keywords))
+        return zones
+
+    def _semantic_zone_match(self) -> tuple:
+        """Match recent speech against zone fingerprints using IDF keyword overlap.
+
+        Scores each zone by summing IDF weights of zone keywords that appear
+        in the recent zone buffer. Returns the midpoint of the best zone.
+        Confidence reflects how cleanly one zone beats the others.
+        """
+        if not self._zone_buffer or not self._zones:
+            return None, 0.0
+
+        buffer_set = set(self._zone_buffer)
+        best_score  = 0.0
+        second_score = 0.0
+        best_zone   = None
+
+        for start, end, keywords in self._zones:
+            score = sum(self._idf.get(w, 0) for w in buffer_set if w in keywords)
+            if score > best_score:
+                second_score = best_score
+                best_score   = score
+                best_zone    = (start, end)
+            elif score > second_score:
+                second_score = score
+
+        if best_zone is None or best_score == 0:
+            return None, 0.0
+
+        # Confidence based on how clearly one zone leads
+        separation = (best_score - second_score) / max(best_score, 1)
+        if separation > 0.4:
+            conf = 0.70
+        elif separation > 0.2:
+            conf = 0.62
+        else:
+            conf = 0.0   # too ambiguous — two zones look equally likely, don't jump
+
+        if conf == 0.0:
+            return None, 0.0
+
+        mid = (best_zone[0] + best_zone[1]) // 2
+        log.debug(f"[ZONE] best_zone={best_zone} score={best_score:.2f} separation={separation:.2f} conf={conf} buf_sample={self._zone_buffer[-5:]}")
+        return mid, conf
 
     # ── Core matching ─────────────────────────────────────────────────────────
 
@@ -223,9 +302,12 @@ class ScriptTracker:
     def feed_words(self, new_words: list, raw_transcript: str = ""):
         cleaned = [_clean(w) for w in new_words if _clean(w)]
         self._buffer.extend(cleaned)
-        # Keep buffer manageable
         if len(self._buffer) > 20:
             self._buffer = self._buffer[-20:]
+        # Zone buffer is wider — accumulates more context for semantic matching
+        self._zone_buffer.extend(cleaned)
+        if len(self._zone_buffer) > ZONE_BUFFER_SIZE:
+            self._zone_buffer = self._zone_buffer[-ZONE_BUFFER_SIZE:]
 
         if self.locked:
             return self.position, 1.0
@@ -251,11 +333,19 @@ class ScriptTracker:
                 return self.position, conf
 
         # No match in window — increment miss counter and hold position
-        # Only rescan after RELOCATE_AFTER consecutive misses so off-script
-        # speech doesn't cause the cursor to jump around.
         self._miss_count += 1
+
         if self._miss_count >= RELOCATE_AFTER and len(self._buffer) >= 3:
-            return self._full_rescan()
+            pos, conf = self._full_rescan()
+            if conf > 0:
+                return pos, conf
+            # N-gram rescan found nothing — try semantic zone match after more misses
+            if self._miss_count >= ZONE_MISS_THRESHOLD:
+                pos, conf = self._semantic_zone_match()
+                if pos is not None:
+                    self.position = pos
+                    self._miss_count = 0
+                    return self.position, conf
 
         return self.position, 0.0
 
@@ -302,6 +392,7 @@ class ScriptTracker:
         self.position = 0
         self.locked = False
         self._buffer = []
+        self._zone_buffer = []
         self._miss_count = 0
 
     # ── Claude fallback ───────────────────────────────────────────────────────
