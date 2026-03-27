@@ -275,14 +275,20 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
       let pi = pagePointers[pg]
       const target = lineWords[0]
 
-      // Scan forward within this page's words for the first word of this line
-      const limit = Math.min(pi + 80, pageWords.length)
-      for (let j = pi; j < limit; j++) {
+      // Timestamps (e.g. "530pm", "615am") are section anchors — search the full
+      // page for them so cue-column lines can't advance the pointer past them.
+      // Regular lines use the sequential forward window (faster, stays in order).
+      const isTimestamp = /^\d{3,6}[a-z]{0,2}$/.test(target)
+      const searchStart = isTimestamp ? 0 : pi
+      const searchEnd   = isTimestamp ? pageWords.length : Math.min(pi + 80, pageWords.length)
+
+      for (let j = searchStart; j < searchEnd; j++) {
         const pw = pageWords[j]
         if (pw.word === target ||
             (target.length >= 4 && pw.word.length >= 4 && target.slice(0, 4) === pw.word.slice(0, 4))) {
           if (!(l in mapping)) mapping[l] = pw.rowIdx
-          pagePointers[pg] = j + 1
+          // Only advance pointer forward, never back (timestamps may find rows behind current pos)
+          if (j + 1 > pi) pagePointers[pg] = j + 1
           break
         }
       }
