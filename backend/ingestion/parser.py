@@ -152,11 +152,19 @@ def _pdf_parse(content: bytes) -> dict:
     except Exception as e:
         raise ValueError(f"PDF parse failed: {e}")
 
+    # Build word list per page so we can return a line_index → page_num mapping
     lines, words = [], []
-    for raw in text.split("\n"):
-        if raw.strip():
-            _add_line(lines, words, raw)
-    return _result(lines, words, None)  # HTML=None → PDF.js handles display
+    line_pages: dict[int, int] = {}  # line_index → 0-based page number
+
+    for page_num, page_text in enumerate(pages):
+        for raw in page_text.split("\n"):
+            if raw.strip():
+                line_idx = _add_line(lines, words, raw)
+                line_pages[line_idx] = page_num
+
+    result = _result(lines, words, None)  # HTML=None → PDF.js handles display
+    result["line_pages"] = line_pages
+    return result
 
 
 def _detect_script_column(pdf):
@@ -260,6 +268,158 @@ def _add_line(lines: list, words: list, text: str) -> int:
     return line_idx
 
 
+def _detect_sections(lines: list, words: list) -> list:
+    """Detect meaningful navigation points for the operator.
+
+    Detects in order of priority:
+    1. Timestamp-prefixed lines (event rundowns): "650p Emcee: Welcome"
+    2. Speaker cue lines (speaker scripts): "Kelly Russell:" alone on a line
+    3. ALL CAPS phase headers: "START OF PROGRAM", "PANEL DISCUSSION"
+
+    Each section includes a one-sentence summary extracted from its content.
+    """
+    line_to_word = {}
+    for i, w in enumerate(words):
+        li = w["line_index"]
+        if li not in line_to_word:
+            line_to_word[li] = i
+
+    # Page header / AV-cue noise — skip entirely
+    _NOISE = re.compile(
+        r'^(Script\s*$|H\s*[–—\-]|for AV Team:|script to be|'
+        r'Use your org|All user edits|Tech Notes|List Emcee|'
+        r'Use Script Below|Record (Virtual|Below)|For Video Recording)',
+        re.IGNORECASE,
+    )
+    _BULLET    = re.compile(r'^[●•○■◆]')   # actual bullet characters only
+    _STAGE_DIR = re.compile(r'^[\[\(]')    # [pause] or (AV notes)         # [pause for applause]
+    _TS = re.compile(
+        r'^(\d{1,2}:\d{2}(?:\s*[ap]m)?|\d{3,4}[ap]|\d{1,2}[ap])\s+(.+)$',
+        re.IGNORECASE,
+    )
+    # Speaker cue: optional "M " prefix, Name:, optional trailing (stage direction)
+    # Matches: "Kelly Russell:"  "M Susan Lieu:"  "Sheryl Feldman: (in-person only)"
+    _SPEAKER = re.compile(
+        r'^(?:(?:PM?|EM|AM|MC)\s+)?(?:Dr\.\s+|Mr\.\s+|Ms\.\s+|Sen\.\s+)?'
+        r'([A-Z][a-zA-Z\-]+(?: [A-Z][a-zA-Z\-]+){0,3}):\s*(?:\([^)]*\))?\s*$'
+    )
+    # Common non-person words that look like speaker names but aren't
+    _NOT_SPEAKER = re.compile(
+        r'^(Platform|Thermometer|Livestream|Donation|Website|Hashtag|'
+        r'Registration|Parking|Venue|Location|Time|Date|Note|Script|Cue|'
+        r'Audio|Video|Music|Slide|Screen|Camera|AV\s|AV$)\b',
+        re.IGNORECASE,
+    )
+
+    def _is_caps_line(text: str) -> bool:
+        a = re.sub(r"[^A-Za-z ]", "", text).strip()
+        w = [x for x in a.split() if len(x) >= 2]
+        return bool(a and a.upper() == a and len(w) >= 2)
+
+    _SINGLE_LETTER_CUE = re.compile(r'^[A-Z]\s+')  # "M Something", "S Something"
+
+    def _summary(start_li: int, end_li: int) -> str:
+        """Extract first meaningful sentence from the section's content lines."""
+        for li in range(start_li + 1, min(end_li, start_li + 30)):
+            text = lines[li].strip().rstrip('\r\n')
+            if not text:
+                continue
+            if (_NOISE.match(text) or _BULLET.match(text) or _STAGE_DIR.match(text)
+                    or _is_caps_line(text) or _SINGLE_LETTER_CUE.match(text)):
+                continue
+            # Stop at next speaker cue
+            if _SPEAKER.match(text):
+                break
+            sentence = re.split(r'(?<=[.!?])\s', text)[0].strip()
+            if len(sentence) >= 10:
+                return (sentence[:110] + "…") if len(sentence) > 110 else sentence
+        return ""
+
+    def _add(sections, li, title, end_li):
+        title = title.strip()
+        if len(title) > 65:
+            title = title[:62] + "…"
+        sections.append({
+            "title": title,
+            "summary": _summary(li, end_li),
+            "line_index": li,
+            "word_index": line_to_word[li],
+        })
+
+    # ── Pass 1: timestamp-prefixed lines (event rundowns) ────────────────────
+    # Only count a line as a scheduled item if the content after the timestamp
+    # starts with an uppercase letter — filters mid-sentence time references like
+    # "8:30AM until then, this is team..." which are NOT agenda items.
+    timestamped_lis = []
+    for li, text in enumerate(lines):
+        stripped = text.strip()
+        if not stripped or li not in line_to_word:
+            continue
+        m = _TS.match(stripped)
+        if m:
+            name = m.group(2).strip()
+            if name and name[0].isupper():   # real agenda item starts uppercase
+                timestamped_lis.append((li, m.group(1), name))
+
+    if timestamped_lis:
+        sections = []
+        for idx, (li, ts, name) in enumerate(timestamped_lis):
+            end_li = timestamped_lis[idx + 1][0] if idx + 1 < len(timestamped_lis) else len(lines)
+            _add(sections, li, f"{ts}  {name}", end_li)
+        return sections
+
+    # ── Pass 2: speaker-cue + ALL CAPS (speaker scripts) ────────────────────
+    candidate_lis = []
+    prev_was_caps = False   # track consecutive ALL CAPS lines to collapse multi-line headers
+
+    for li, text in enumerate(lines):
+        stripped = text.strip().rstrip('\r\n')
+        if not stripped or li not in line_to_word:
+            continue
+        if _NOISE.match(stripped) or _BULLET.match(stripped) or _STAGE_DIR.match(stripped):
+            prev_was_caps = False
+            continue
+
+        is_speaker = bool(_SPEAKER.match(stripped) and not _NOT_SPEAKER.match(stripped))
+
+        is_caps = False
+        if not is_speaker:
+            alpha_only = re.sub(r"[^A-Za-z ]", "", stripped).strip()
+            alpha_words = [w for w in alpha_only.split() if len(w) >= 2]
+            if (alpha_only and alpha_only.upper() == alpha_only
+                    and len(alpha_words) >= 2 and len(stripped.split()) <= 8
+                    and not stripped.endswith(')')):  # skip truncated AV-note fragments
+                is_caps = True
+
+        if is_speaker:
+            # Always add speaker cues — strip leading cue prefix (M, PM, EM, AM, MC)
+            display = re.sub(r'^(?:PM?|EM|AM|MC)\s+', '', stripped)
+            candidate_lis.append((li, display))
+            prev_was_caps = False
+        elif is_caps:
+            if not prev_was_caps:
+                # First line of an ALL CAPS block — add it
+                candidate_lis.append((li, stripped))
+            # Stay in caps mode regardless (continuation lines get skipped next iteration)
+            prev_was_caps = True
+        else:
+            prev_was_caps = False
+
+    # Deduplicate same title only within a 6-line window (back-to-back cue repeats)
+    deduped = []
+    for li, title in candidate_lis:
+        if deduped and deduped[-1][1] == title and li - deduped[-1][0] < 6:
+            continue
+        deduped.append((li, title))
+
+    sections = []
+    for idx, (li, title) in enumerate(deduped):
+        end_li = deduped[idx + 1][0] if idx + 1 < len(deduped) else len(lines)
+        _add(sections, li, title, end_li)
+
+    return sections
+
+
 def _result(lines: list, words: list, html) -> dict:
     return {
         "lines": lines,
@@ -267,6 +427,7 @@ def _result(lines: list, words: list, html) -> dict:
         "word_count": len(words),
         "line_count": len(lines),
         "html": html,
+        "sections": _detect_sections(lines, words),
     }
 
 

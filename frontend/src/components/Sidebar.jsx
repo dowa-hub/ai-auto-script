@@ -1,132 +1,180 @@
 import { useState, useRef } from 'react'
-import FileUpload from './FileUpload.jsx'
 
-export default function Sidebar({ onScriptLoaded, onSettingsChange, sttStatus }) {
-  const [dgKey, setDgKey]       = useState('')
-  const [connecting, setConn]   = useState(false)
-  const inputRef                = useRef(null)
+const ACCEPTED = '.pdf,.docx,.doc,.xlsx,.xls,.txt,.jpg,.jpeg,.png,.tiff,.tif'
+
+export default function Sidebar({ onScriptLoaded, onSettingsChange, sttStatus, sections = [], onSectionSeek }) {
+  const [dgKey,      setDgKey]    = useState('')
+  const [connecting, setConn]     = useState(false)
+  const [uploading,  setUploading] = useState(false)
+  const [uploadErr,  setUploadErr] = useState('')
+  const fileRef = useRef(null)
+
+  const dgConnected = sttStatus?.engine === 'deepgram' && sttStatus?.connected
+  const dgError     = sttStatus?.engine === 'deepgram' && !sttStatus?.connected && sttStatus?.error
+
+  async function handleFile(file) {
+    if (!file) return
+    setUploading(true)
+    setUploadErr('')
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      const res  = await fetch('/api/upload-script', { method: 'POST', body: form })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Upload failed')
+      const scriptRes  = await fetch('/api/script')
+      const scriptData = await scriptRes.json()
+      onScriptLoaded(scriptData, file.name)
+    } catch (e) {
+      setUploadErr(e.message)
+    } finally {
+      setUploading(false)
+    }
+  }
 
   async function connectDeepgram() {
     if (!dgKey.trim()) return
     setConn(true)
     await onSettingsChange({ deepgram_key: dgKey.trim() })
-    setDgKey('')        // clear from UI immediately — never lingers
+    setDgKey('')
     setConn(false)
   }
 
-  const dgConnected = sttStatus?.engine === 'deepgram' && sttStatus?.connected
-  const dgError     = sttStatus?.engine === 'deepgram' && !sttStatus?.connected
-
   return (
-    <div style={{
-      width: 280, flexShrink: 0,
-      borderRight: '1px solid var(--border)',
-      background: 'var(--surface)',
-      display: 'flex', flexDirection: 'column',
-      padding: '16px', gap: 24, overflowY: 'auto',
-    }}>
-      <Logo />
+    <div
+      style={{
+        width: 280, flexShrink: 0,
+        borderRight: '1px solid var(--border)',
+        background: 'var(--surface)',
+        display: 'flex', flexDirection: 'column',
+        overflow: 'hidden',
+      }}
+      onDragOver={e => e.preventDefault()}
+      onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) handleFile(f) }}
+    >
 
-      <FileUpload onScriptLoaded={(data, name) => onScriptLoaded(data, name)} />
-
-      <Section title="STT Engine">
-
-        {/* ── Deepgram section ── */}
-        <Label>Deepgram (cloud)</Label>
-
-        {dgConnected ? (
-          // Connected state
+      {/* ── Top bar: logo + import button ── */}
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        padding: '13px 14px 11px',
+        borderBottom: '1px solid var(--border)',
+        flexShrink: 0,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <div style={{
-            background: 'rgba(33,150,243,0.1)', border: '1px solid rgba(33,150,243,0.3)',
-            borderRadius: 6, padding: '8px 12px', marginBottom: 8,
-            display: 'flex', alignItems: 'center',
+            width: 26, height: 26, background: 'var(--amber)', borderRadius: 5,
+            display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13, flexShrink: 0,
+          }}>🎙</div>
+          <span style={{ fontWeight: 700, fontSize: 13 }}>AI Auto Script</span>
+        </div>
+
+        <button
+          onClick={() => fileRef.current?.click()}
+          disabled={uploading}
+          style={{
+            background: 'var(--amber)', color: '#000',
+            fontWeight: 700, fontSize: 12,
+            padding: '5px 12px', borderRadius: 4,
+            cursor: uploading ? 'wait' : 'pointer',
+            flexShrink: 0, border: 'none',
+          }}
+        >
+          {uploading ? 'Loading…' : '+ Import'}
+        </button>
+
+        <input
+          ref={fileRef}
+          type="file"
+          accept={ACCEPTED}
+          style={{ display: 'none' }}
+          onChange={e => { handleFile(e.target.files[0]); e.target.value = '' }}
+        />
+      </div>
+
+      {uploadErr && (
+        <div style={{ padding: '6px 14px', fontSize: 11, color: 'var(--red)', flexShrink: 0 }}>
+          {uploadErr}
+        </div>
+      )}
+
+      {/* ── Sections — fills all remaining space ── */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '10px 10px 6px' }}>
+        {sections.length === 0 ? (
+          <div style={{
+            color: 'var(--text-dim)', fontSize: 12,
+            textAlign: 'center', marginTop: 48, lineHeight: 1.8,
           }}>
-            <span style={{ fontSize: 12, color: '#64b5f6', display: 'flex', alignItems: 'center', gap: 6 }}>
-              <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#4caf50', display: 'inline-block' }} />
-              Deepgram Nova-3 live
-            </span>
+            Import a script<br />to see sections here
           </div>
         ) : (
-          // Paste key + connect
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            {sections.map((sec, i) => (
+              <button
+                key={i}
+                onClick={() => onSectionSeek(sec.word_index)}
+                style={{
+                  width: '100%', boxSizing: 'border-box',
+                  background: 'var(--surface2)',
+                  border: '1px solid var(--border)',
+                  color: 'var(--text)',
+                  padding: '7px 10px',
+                  fontSize: 13, textAlign: 'left',
+                  cursor: 'pointer', borderRadius: 4,
+                  whiteSpace: 'normal', lineHeight: 1.3,
+                  display: 'flex', flexDirection: 'column', gap: 2,
+                }}
+              >
+                <span style={{ fontWeight: 600 }}>{sec.title}</span>
+                {sec.summary && (
+                  <span style={{ fontSize: 11, color: 'var(--text-dim)', fontWeight: 400, lineHeight: 1.4 }}>
+                    {sec.summary}
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* ── Bottom: Deepgram key ── */}
+      <div style={{
+        padding: '10px 12px 13px',
+        borderTop: '1px solid var(--border)',
+        flexShrink: 0,
+      }}>
+        {dgConnected ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 12, color: '#64b5f6' }}>
+            <span style={{
+              width: 7, height: 7, borderRadius: '50%',
+              background: '#4caf50', display: 'inline-block', flexShrink: 0,
+            }} />
+            Deepgram Nova-3 connected
+          </div>
+        ) : (
           <>
+            <input
+              type="password"
+              value={dgKey}
+              onChange={e => setDgKey(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && connectDeepgram()}
+              placeholder={connecting ? 'Connecting…' : 'Deepgram API key — press Enter'}
+              style={{ width: '100%', boxSizing: 'border-box', fontSize: 12 }}
+              disabled={connecting}
+            />
             {dgError && (
-              <div style={{ fontSize: 11, color: 'var(--red)', marginBottom: 6 }}>
+              <div style={{ marginTop: 5, fontSize: 11, color: 'var(--red)' }}>
                 Connection failed — check your key
               </div>
             )}
-            <div style={{ display: 'flex', gap: 6 }}>
-              <input
-                ref={inputRef}
-                type="password"
-                value={dgKey}
-                onChange={e => setDgKey(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && connectDeepgram()}
-                placeholder="Paste API key…"
-                style={{ flex: 1, minWidth: 0 }}
-              />
-              <button
-                onClick={connectDeepgram}
-                disabled={!dgKey.trim() || connecting}
-                style={{ background: 'var(--amber)', color: '#000', fontWeight: 600, padding: '5px 10px', flexShrink: 0 }}
-              >
-                {connecting ? '…' : 'Connect'}
-              </button>
-            </div>
-            <p style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 5 }}>
-              Not saved anywhere · ~$0.006/min · 12k free min/yr
-            </p>
+            {!dgError && (
+              <div style={{ marginTop: 4, fontSize: 11, color: 'var(--text-dim)' }}>
+                Never stored · ~$0.006/min
+              </div>
+            )}
           </>
         )}
-
-      </Section>
-
-      <Section title="Tips">
-        <ul style={{ fontSize: 12, color: 'var(--text-dim)', paddingLeft: 16, lineHeight: 1.8 }}>
-          <li>Click any line to jump there manually</li>
-          <li>Auto-tracking resumes after 4s</li>
-          <li>Amber = AI tracking · Blue = manual lock</li>
-          <li>API key is never stored to disk</li>
-        </ul>
-      </Section>
-    </div>
-  )
-}
-
-function Logo() {
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-      <div style={{
-        width: 28, height: 28, background: 'var(--amber)',
-        borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 15,
-      }}>
-        🎙
       </div>
-      <div>
-        <div style={{ fontWeight: 700, fontSize: 14 }}>AI Auto Script</div>
-        <div style={{ fontSize: 10, color: 'var(--text-dim)' }}>Script follower</div>
-      </div>
-    </div>
-  )
-}
 
-function Section({ title, children }) {
-  return (
-    <div>
-      <div style={{
-        fontSize: 10, fontWeight: 700, letterSpacing: '0.08em',
-        textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 10,
-      }}>
-        {title}
-      </div>
-      {children}
-    </div>
-  )
-}
-
-function Label({ children, style }) {
-  return (
-    <div style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 4, ...style }}>
-      {children}
     </div>
   )
 }

@@ -9,10 +9,12 @@ import Sidebar        from './components/Sidebar.jsx'
 export default function App() {
   const [script,      setScript]      = useState(null)
   const [fileInfo,    setFileInfo]    = useState(null)  // { name } for DocumentViewer
+  const [sections,    setSections]    = useState([])
   const [currentLine, setCurrentLine] = useState(null)
-  const [confidence,  setConfidence]  = useState(0)
-  const [transcript,  setTranscript]  = useState('')
-  const [locked,      setLocked]      = useState(false)
+  const [confidence,     setConfidence]     = useState(0)
+  const [transcript,     setTranscript]     = useState('')
+  const [locked,         setLocked]         = useState(false)
+  const [trackerStatus,  setTrackerStatus]  = useState({ state: 'idle', confidence: 0, missCount: 0 })
 
   // ── WebSocket ──────────────────────────────────────────────────────────────
   const onMessage = useCallback((msg) => {
@@ -22,6 +24,11 @@ export default function App() {
     if (msg.type === 'position') {
       setCurrentLine(msg.line_index)
       setConfidence(msg.confidence)
+      setTrackerStatus({ state: 'tracking', confidence: msg.confidence, missCount: 0 })
+    }
+    if (msg.type === 'tracker_status') {
+      setConfidence(msg.confidence ?? 0)
+      setTrackerStatus({ state: msg.state, confidence: msg.confidence ?? 0, missCount: msg.miss_count ?? 0 })
     }
   }, [])
 
@@ -53,6 +60,19 @@ export default function App() {
     }
   }
 
+  async function handleSectionSeek(wordIndex) {
+    setLocked(true)
+    await fetch('/api/seek-confirmed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ word_index: wordIndex }),
+    })
+    if (script) {
+      const word = script.words[wordIndex]
+      if (word) setCurrentLine(word.line_index)
+    }
+  }
+
   async function handleResume() {
     setLocked(false)
     await fetch('/api/resume', { method: 'POST' })
@@ -63,6 +83,7 @@ export default function App() {
     setCurrentLine(null)
     setConfidence(0)
     setTranscript('')
+    setTrackerStatus({ state: 'idle', confidence: 0, missCount: 0 })
     await fetch('/api/reset', { method: 'POST' })
   }
 
@@ -83,6 +104,7 @@ export default function App() {
         transcript={transcript}
         confidence={confidence}
         locked={locked}
+        trackerStatus={trackerStatus}
         currentLine={currentLine}
         lineCount={script?.line_count}
         onResume={handleResume}
@@ -92,9 +114,11 @@ export default function App() {
       {/* Main area: sidebar + script */}
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         <Sidebar
-          onScriptLoaded={(data, name) => { setScript(data); setFileInfo({ name }) }}
+          onScriptLoaded={(data, name) => { setScript(data); setFileInfo({ name }); setSections(data.sections ?? []) }}
           onSettingsChange={handleSettingsChange}
           sttStatus={sttStatus}
+          sections={sections}
+          onSectionSeek={handleSectionSeek}
         />
 
         <DocumentViewer
@@ -102,6 +126,7 @@ export default function App() {
           currentLine={currentLine}
           locked={locked}
           scriptData={script}
+          onSeek={handleSeek}
         />
       </div>
 

@@ -44,13 +44,15 @@ function smoothScrollTo(element, targetY, duration = 800) {
   _scrollRaf = requestAnimationFrame(step)
 }
 
-export default function DocumentViewer({ fileInfo, currentLine, locked, scriptData }) {
-  const scrollRef   = useRef(null)   // outer scrollable div
-  const innerRef    = useRef(null)   // inner div — PDF pages rendered here
-  const highlightRef = useRef(null)  // amber bar (PDF mode, absolutely positioned)
-  const pdfLinesRef = useRef([])     // [{yTop, yBottom}] in innerRef coords, per script line
-  const pdfTextRowsRef = useRef([])  // [{text, yTop, yBot}] — all text rows with positions
-  const lineToPdfRow = useRef({})   // backend line_index → PDF row index (built once at load)
+export default function DocumentViewer({ fileInfo, currentLine, locked, scriptData, onSeek }) {
+  const scrollRef      = useRef(null)   // outer scrollable div
+  const innerRef       = useRef(null)   // inner div — PDF pages rendered here
+  const highlightRef   = useRef(null)   // amber bar (PDF mode, absolutely positioned)
+  const pdfLinesRef    = useRef([])     // [{yTop, yBottom}] in innerRef coords, per script line
+  const pdfTextRowsRef = useRef([])     // [{text, yTop, yBot, page}] — all text rows with positions
+  const lineToPdfRow   = useRef({})     // backend line_index → PDF row index (built once at load)
+  const pageYOffsets   = useRef([])     // [topY] per 0-based page index
+  const rowToPage      = useRef([])     // PDF row index → 0-based page number
 
   const [mode, setMode]           = useState(null)  // 'pdf' | 'html' | 'image' | null
   const [htmlContent, setHtml]    = useState('')
@@ -119,13 +121,17 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
     let topOffset = 0
     const allLines = []
     const allTextRows = []
+    const _pageYOffsets = []
+    const _rowToPage    = []
 
     for (let p = 1; p <= pdf.numPages; p++) {
+      const pageIdx  = p - 1
       const page     = await pdf.getPage(p)
       const rawVp    = page.getViewport({ scale: 1 })
       const maxW     = (scrollRef.current?.clientWidth || 900) - 48
       const scale    = Math.min(maxW / rawVp.width, 2.2)
       const viewport = page.getViewport({ scale })
+      _pageYOffsets.push(topOffset)
 
       // Page wrapper (white card)
       const wrap = document.createElement('div')
@@ -176,7 +182,9 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
             yTop: topOffset + yTop,
             yBot: topOffset + yBot,
             text: texts.join(' ').toLowerCase().replace(/[^\w\s']/g, ''),
+            page: pageIdx,
           }
+          _rowToPage.push(pageIdx)
           allLines.push(row)
           allTextRows.push(row)
         })
@@ -184,8 +192,10 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
       topOffset += viewport.height + GAP
     }
 
-    pdfLinesRef.current = allLines
+    pdfLinesRef.current    = allLines
     pdfTextRowsRef.current = allTextRows
+    pageYOffsets.current   = _pageYOffsets
+    rowToPage.current      = _rowToPage
 
     // Build a mapping from backend line_index → PDF row index
     // by matching words sequentially between both sides
@@ -208,50 +218,67 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
   }
 
   function buildLineMapping(pdfRows) {
-    // Build a one-time mapping: backend line_index → PDF row index
-    // Strategy: concatenate all PDF row words and all backend words,
-    // then walk through both sequences matching words to link lines to rows.
+    // Build a one-time mapping: backend line_index → PDF row index.
+    //
+    // Key insight: multi-column PDFs have extra words (Time, Cues columns) between
+    // script words, so a global sequential search drifts badly. Instead we partition
+    // by page — the backend tells us which page each line came from (scriptData.line_pages),
+    // and we only match against PDF rows from that same page. This makes the search
+    // window irrelevant and eliminates cross-page false matches entirely.
     if (!scriptData?.lines || !pdfRows.length) return
 
-    const mapping = {}
-    const pdfWords = []  // [{rowIdx, word}]
+    const linePagesMap = scriptData.line_pages || {}  // line_index → page_num (0-based)
+    const hasPageInfo  = Object.keys(linePagesMap).length > 0
+
+    // Group PDF rows by page
+    const rowsByPage = {}  // page → [{rowIdx, words:[]}]
     for (let r = 0; r < pdfRows.length; r++) {
-      const words = pdfRows[r].text.split(/\s+/).filter(w => w.length > 0)
-      for (const w of words) {
-        pdfWords.push({ rowIdx: r, word: w })
+      const pg = pdfRows[r].page ?? rowToPage.current[r] ?? 0
+      if (!rowsByPage[pg]) rowsByPage[pg] = []
+      const words = pdfRows[r].text.split(/\s+/).filter(w => w.length > 1)
+      rowsByPage[pg].push({ rowIdx: r, words })
+    }
+
+    // Build flat pdfWords per page for sequential scanning within page
+    const pdfWordsByPage = {}
+    for (const [pg, rows] of Object.entries(rowsByPage)) {
+      pdfWordsByPage[pg] = []
+      for (const { rowIdx, words } of rows) {
+        for (const w of words) pdfWordsByPage[pg].push({ rowIdx, word: w })
       }
     }
 
-    const backendWords = [] // [{lineIdx, word}]
+    const mapping = {}
+    // Track per-page scan pointer so sequential within-page matching stays in order
+    const pagePointers = {}
+
     for (let l = 0; l < scriptData.lines.length; l++) {
-      const cleaned = scriptData.lines[l].toLowerCase().replace(/[^\w\s']/g, '')
-      const words = cleaned.split(/\s+/).filter(w => w.length > 0)
-      for (const w of words) {
-        backendWords.push({ lineIdx: l, word: w })
-      }
-    }
+      const cleaned = scriptData.lines[l].toLowerCase().replace(/[^\w\s]/g, '')
+      const lineWords = cleaned.split(/\s+/).filter(w => w.length > 1)
+      if (!lineWords.length) continue
 
-    // Walk both word sequences, matching words to build the line→row mapping
-    let pi = 0  // pdf word pointer
-    for (let bi = 0; bi < backendWords.length && pi < pdfWords.length; bi++) {
-      const bw = backendWords[bi]
-      // Search ahead in PDF words for a match (allow some skips for OCR differences)
-      const searchLimit = Math.min(pi + 15, pdfWords.length)
-      for (let j = pi; j < searchLimit; j++) {
-        if (pdfWords[j].word === bw.word ||
-            (bw.word.length >= 4 && pdfWords[j].word.length >= 4 && bw.word.slice(0, 4) === pdfWords[j].word.slice(0, 4))) {
-          // Match found — record the line→row mapping (first occurrence wins)
-          if (!(bw.lineIdx in mapping)) {
-            mapping[bw.lineIdx] = pdfWords[j].rowIdx
-          }
-          pi = j + 1
+      const pg = hasPageInfo ? (linePagesMap[l] ?? 0) : 0
+      const pageWords = pdfWordsByPage[pg] || []
+      if (!pagePointers[pg]) pagePointers[pg] = 0
+
+      let pi = pagePointers[pg]
+      const target = lineWords[0]
+
+      // Scan forward within this page's words for the first word of this line
+      const limit = Math.min(pi + 80, pageWords.length)
+      for (let j = pi; j < limit; j++) {
+        const pw = pageWords[j]
+        if (pw.word === target ||
+            (target.length >= 4 && pw.word.length >= 4 && target.slice(0, 4) === pw.word.slice(0, 4))) {
+          if (!(l in mapping)) mapping[l] = pw.rowIdx
+          pagePointers[pg] = j + 1
           break
         }
       }
     }
 
     lineToPdfRow.current = mapping
-    console.log(`[PDF] Built line mapping: ${Object.keys(mapping).length} backend lines → PDF rows`)
+    console.log(`[PDF] Built line mapping: ${Object.keys(mapping).length}/${scriptData.lines.length} lines mapped`)
   }
 
   function highlightPdfByText(lineIdx) {
@@ -277,7 +304,17 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
       if (closest != null) rowIdx = closest
     }
 
-    if (rowIdx == null) rowIdx = Math.min(lineIdx, rows.length - 1)
+    // Page-level fallback: if no row matched, scroll to the page the backend says this line is on
+    if (rowIdx == null) {
+      const pg = scriptData?.line_pages?.[lineIdx]
+      if (pg != null && pageYOffsets.current[pg] != null) {
+        const sc = scrollRef.current
+        if (sc) smoothScrollTo(sc, Math.max(0, pageYOffsets.current[pg] - sc.clientHeight * 0.1), 800)
+        if (bar) bar.style.opacity = '0'
+        return
+      }
+      rowIdx = Math.min(lineIdx, rows.length - 1)
+    }
 
     const entry = rows[rowIdx]
     if (!entry) return
@@ -306,6 +343,52 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
     el.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }
 
+  // ── Click-to-seek ──────────────────────────────────────────────────────────
+  function handleDocClick(e) {
+    if (!onSeek || !scriptData?.words) return
+
+    if (mode === 'html') {
+      const lineEl = e.target.closest('[data-line]')
+      if (!lineEl) return
+      const lineIdx = parseInt(lineEl.getAttribute('data-line'), 10)
+      if (isNaN(lineIdx)) return
+      const wordIndex = scriptData.words.findIndex(w => w.line_index === lineIdx)
+      if (wordIndex >= 0) {
+        // Brief blue flash so the operator knows the click registered
+        lineEl.style.outline = '2px solid #2196f3'
+        lineEl.style.background = 'rgba(33,150,243,0.15)'
+        setTimeout(() => {
+          lineEl.style.outline = ''
+          lineEl.style.background = ''
+        }, 600)
+        onSeek(wordIndex)
+      }
+    }
+
+    if (mode === 'pdf') {
+      const inner = innerRef.current
+      if (!inner) return
+      const rect = inner.getBoundingClientRect()
+      const clickY = e.clientY - rect.top + scrollRef.current.scrollTop
+      const rows = pdfTextRowsRef.current
+      if (!rows.length) return
+      let bestRow = 0, bestDist = Infinity
+      for (let i = 0; i < rows.length; i++) {
+        const mid = (rows[i].yTop + rows[i].yBot) / 2
+        const dist = Math.abs(mid - clickY)
+        if (dist < bestDist) { bestDist = dist; bestRow = i }
+      }
+      let targetLine = null, closestDist = Infinity
+      for (const [lineStr, rowIdx] of Object.entries(lineToPdfRow.current)) {
+        const dist = Math.abs(rowIdx - bestRow)
+        if (dist < closestDist) { closestDist = dist; targetLine = parseInt(lineStr, 10) }
+      }
+      if (targetLine == null) return
+      const wordIndex = scriptData.words.findIndex(w => w.line_index === targetLine)
+      if (wordIndex >= 0) onSeek(wordIndex)
+    }
+  }
+
   // ── Render ─────────────────────────────────────────────────────────────────
   if (!fileInfo) {
     return (
@@ -321,7 +404,8 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
   return (
     <div
       ref={scrollRef}
-      style={{ flex: 1, overflowY: 'auto', background: '#222', padding: '24px 0' }}
+      onClick={handleDocClick}
+      style={{ flex: 1, overflowY: 'auto', background: '#222', padding: '24px 0', cursor: onSeek ? 'pointer' : 'default' }}
     >
       {loading && (
         <div style={{ textAlign: 'center', paddingTop: 80, color: 'var(--text-dim)' }}>

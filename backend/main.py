@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, HTMLResponse
 
 from ingestion.parser import parse_unified
-from tracker import ScriptTracker
+from tracker import ScriptTracker, log as tracker_log
 from stt.cloud import CloudSTT
 
 load_dotenv()
@@ -164,6 +164,15 @@ async def seek(body: dict):
     return {"ok": True, "position": tracker.position}
 
 
+@app.post("/api/seek-confirmed")
+async def seek_confirmed(body: dict):
+    if not tracker:
+        raise HTTPException(status_code=400, detail="No script loaded")
+    word_index = body.get("word_index", 0)
+    tracker.confirmed_seek(word_index)
+    return {"ok": True, "position": tracker.position}
+
+
 @app.post("/api/resume")
 async def resume():
     if tracker:
@@ -205,36 +214,38 @@ async def audio_ws(websocket: WebSocket):
         old_pos = tracker.position
         position, confidence = tracker.update(transcript)
 
-        # Don't move the cursor on weak matches — hold position and keep waiting
         MIN_CONFIDENCE = 0.60
-        if 0 < confidence < MIN_CONFIDENCE:
-            from tracker import log as tlog
-            tlog.debug(f"[SKIP]  \"{transcript}\" → conf={confidence:.2f} below threshold, pos stays {position}")
+
+        if confidence == 0:
+            # No match found — tell frontend how long we've been waiting
+            miss = tracker._miss_count
+            state = "searching" if miss >= 8 else "waiting"
+            tracker_log.debug(f"[MISS]  \"{transcript}\" → pos stays {position}, buf={tracker._buffer[-5:]}")
+            await send({"type": "tracker_status", "state": state, "confidence": 0, "miss_count": miss})
             return
 
-        # LOG every tracker decision to terminal
-        if confidence > 0:
-            # Compensate for STT + processing latency: advance position ~3 words
-            # so the highlight shows where the speaker IS, not where they WERE
-            lookahead = min(position + 3, len(current_script["words"]) - 1)
-            display_line = current_script["words"][lookahead]["line_index"]
-            current_line = current_script["words"][position]["line_index"]
-            ctx_s = max(0, position - 2)
-            ctx_e = min(len(current_script["words"]), position + 6)
-            ctx = " ".join(current_script["words"][j]["word"] for j in range(ctx_s, ctx_e))
-            from tracker import log as tlog
-            tlog.debug(f"[TRACK] \"{transcript}\" → pos={old_pos}→{position} line={current_line}→display={display_line} conf={confidence:.2f} buf={tracker._buffer[-5:]}")
-            tlog.debug(f"        script: ...{ctx}...")
-            await send({
-                "type":       "position",
-                "word_index": lookahead,
-                "line_index": display_line,
-                "confidence": round(confidence, 2),
-                "transcript": transcript,
-            })
-        else:
-            from tracker import log as tlog
-            tlog.debug(f"[MISS]  \"{transcript}\" → pos stays {position}, buf={tracker._buffer[-5:]}")
+        if confidence < MIN_CONFIDENCE:
+            # Match found but too weak to move cursor
+            tracker_log.debug(f"[SKIP]  \"{transcript}\" → conf={confidence:.2f} below threshold, pos stays {position}")
+            await send({"type": "tracker_status", "state": "holding", "confidence": round(confidence, 2), "miss_count": tracker._miss_count})
+            return
+
+        # Good match — move cursor and send position
+        lookahead = min(position + 3, len(current_script["words"]) - 1)
+        display_line = current_script["words"][lookahead]["line_index"]
+        current_line = current_script["words"][position]["line_index"]
+        ctx_s = max(0, position - 2)
+        ctx_e = min(len(current_script["words"]), position + 6)
+        ctx = " ".join(current_script["words"][j]["word"] for j in range(ctx_s, ctx_e))
+        tracker_log.debug(f"[TRACK] \"{transcript}\" → pos={old_pos}→{position} line={current_line}→display={display_line} conf={confidence:.2f} buf={tracker._buffer[-5:]}")
+        tracker_log.debug(f"        script: ...{ctx}...")
+        await send({
+            "type":       "position",
+            "word_index": lookahead,
+            "line_index": display_line,
+            "confidence": round(confidence, 2),
+            "transcript": transcript,
+        })
 
     # Connect Deepgram
     if stt_engine:
