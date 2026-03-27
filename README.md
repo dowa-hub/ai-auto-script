@@ -9,9 +9,7 @@ A browser-based script follower for live A/V production. Upload a script (PDF, D
 3. Click **Listen** — the app transcribes speech and highlights the current position in the script
 4. The script auto-scrolls as the speaker progresses
 
-Supports two speech-to-text engines:
-- **Whisper (offline)** — free, runs locally, no internet required
-- **Deepgram Nova-3 (cloud)** — faster and more accurate, requires a Deepgram API key
+Speech-to-text is powered by **Deepgram Nova-3**. You'll need a free Deepgram account — it includes $200 of credit per year (roughly 550 hours of audio). [Sign up at deepgram.com](https://deepgram.com)
 
 ---
 
@@ -94,16 +92,12 @@ Then open `http://localhost:5173` in your browser.
 
 ## Configuration
 
-Edit `backend/.env` to configure:
+Optionally edit `backend/.env`:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `STT_MODE` | `offline` | `offline` (Whisper, free) or `cloud` (Deepgram) |
-| `WHISPER_MODEL` | `base.en` | Whisper model: `tiny.en` (fast), `base.en` (balanced), `small.en` or `medium.en` (accurate) |
-| `DEEPGRAM_API_KEY` | | Your Deepgram API key (only needed for cloud mode) |
-| `ANTHROPIC_API_KEY` | | Optional Claude API key for fallback recovery |
-
-You can also change STT settings from the sidebar in the app — no need to edit the file directly.
+| Variable | Description |
+|----------|-------------|
+| `DEEPGRAM_API_KEY` | Your Deepgram API key (or paste it in the sidebar at runtime) |
+| `ANTHROPIC_API_KEY` | Optional — enables Claude fallback for hard tracking recoveries |
 
 ---
 
@@ -121,7 +115,6 @@ You can also change STT settings from the sidebar in the app — no need to edit
 
 ## Usage Tips
 
-- Use a **Deepgram API key** for the best tracking accuracy — it's significantly faster than offline Whisper
 - The app works best when the speaker is reading directly from the script
 - Click any line in the script to manually jump there
 - The script is cached locally, so it survives server restarts
