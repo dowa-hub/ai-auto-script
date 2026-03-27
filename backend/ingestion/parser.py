@@ -133,31 +133,35 @@ def _pdf_parse(content: bytes) -> dict:
         # Detect "Script" column boundaries for table-based PDFs
         script_col = _detect_script_column(pdf)
 
-        pages = []
+        script_pages = []   # column-clipped (for word tracking)
+        full_pages   = []   # full page text (for section detection with timestamps)
         for page in pdf:
             textpage = page.get_textpage()
             if script_col:
                 left, right = script_col
-                text = textpage.get_text_bounded(
+                sp = textpage.get_text_bounded(
                     left=left, bottom=0,
                     right=right, top=page.get_height(),
                 )
+                fp = textpage.get_text_bounded()  # includes Time + Cues columns
             else:
-                text = textpage.get_text_bounded()
-            pages.append(text)
+                sp = textpage.get_text_bounded()
+                fp = sp  # same — no column stripping
+            script_pages.append(sp)
+            full_pages.append(fp)
 
-        text = "\n".join(pages)
-        if len(text.strip()) < 100:
+        if len("\n".join(script_pages).strip()) < 100:
             # OCR fallback — treat entire result as a single "page"
-            pages = [_ocr_pdf(content)]
+            script_pages = [_ocr_pdf(content)]
+            full_pages   = script_pages
     except Exception as e:
         raise ValueError(f"PDF parse failed: {e}")
 
-    # Build word list per page so we can return a line_index → page_num mapping
+    # Build word list from script column only (accurate for STT tracking)
     lines, words = [], []
     line_pages: dict[int, int] = {}  # line_index → 0-based page number
 
-    for page_num, page_text in enumerate(pages):
+    for page_num, page_text in enumerate(script_pages):
         for raw in page_text.split("\n"):
             if raw.strip():
                 line_idx = _add_line(lines, words, raw)
@@ -165,7 +169,67 @@ def _pdf_parse(content: bytes) -> dict:
 
     result = _result(lines, words, None)  # HTML=None → PDF.js handles display
     result["line_pages"] = line_pages
+
+    # For table-format PDFs, re-detect sections from FULL page text so that
+    # timestamps in the Time column appear in section titles (e.g. "5:15PM Kelly Russell:")
+    if script_col:
+        result["sections"] = _sections_from_full_pages(
+            full_pages, lines, words, line_pages
+        )
+
     return result
+
+
+def _sections_from_full_pages(full_pages, script_lines, script_words, line_pages):
+    """Detect sections from full-page text (includes Time column timestamps),
+    then remap each section's word_index to the script-column word list."""
+    full_lines, full_words = [], []
+    full_line_pages: dict[int, int] = {}
+    for page_num, page_text in enumerate(full_pages):
+        for raw in page_text.split("\n"):
+            if raw.strip():
+                li = _add_line(full_lines, full_words, raw)
+                full_line_pages[li] = page_num
+
+    full_sections = _detect_sections(full_lines, full_words)
+    if not full_sections:
+        return _detect_sections(script_lines, script_words)  # fallback
+
+    # Build per-page word index for script-column (page → [(word_idx, clean)])
+    script_words_by_page: dict[int, list] = {}
+    for wi, w in enumerate(script_words):
+        pg = line_pages.get(w["line_index"], 0)
+        script_words_by_page.setdefault(pg, []).append((wi, w["clean"]))
+
+    _TS_PREFIX = re.compile(
+        r'^(\d{1,2}:\d{2}(?:\s*[ap]m)?|\d{3,4}[ap]|\d{1,2}[ap]m?)\s+',
+        re.IGNORECASE,
+    )
+
+    remapped = []
+    for sec in full_sections:
+        pg = full_line_pages.get(sec["line_index"], 0)
+        # Strip timestamp prefix to isolate speaker/section name
+        name_part = _TS_PREFIX.sub("", sec["title"]).strip().rstrip(":")
+        key_words  = [w for w in re.findall(r"[A-Za-z]{3,}", name_part)][:2]
+
+        word_idx = None
+        if key_words and pg in script_words_by_page:
+            key0 = key_words[0].lower()
+            for wi, clean in script_words_by_page[pg]:
+                if clean == key0 or (len(key0) >= 4 and clean.startswith(key0[:4])):
+                    word_idx = wi
+                    break
+
+        if word_idx is not None:
+            remapped.append({
+                "title":      sec["title"],
+                "summary":    sec["summary"],
+                "line_index": script_words[word_idx]["line_index"],
+                "word_index": word_idx,
+            })
+
+    return remapped if remapped else _detect_sections(script_lines, script_words)
 
 
 def _detect_script_column(pdf):
