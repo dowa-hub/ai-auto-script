@@ -216,8 +216,18 @@ def _sections_from_full_pages(full_pages, script_lines, script_words, line_pages
         word_idx = None
         if key_words and pg in script_words_by_page:
             key0 = key_words[0].lower()
-            for wi, clean in script_words_by_page[pg]:
+            key1 = key_words[1].lower() if len(key_words) > 1 else None
+            page_wds = script_words_by_page[pg]
+            for i, (wi, clean) in enumerate(page_wds):
                 if clean == key0 or (len(key0) >= 4 and clean.startswith(key0[:4])):
+                    if key1:
+                        # key1 must also appear within the next 4 words on the same page
+                        nearby = [c for _, c in page_wds[i + 1: i + 5]]
+                        if not any(
+                            c == key1 or (len(key1) >= 4 and c.startswith(key1[:4]))
+                            for c in nearby
+                        ):
+                            continue
                     word_idx = wi
                     break
 
@@ -384,20 +394,26 @@ def _detect_sections(lines: list, words: list) -> list:
     _SINGLE_LETTER_CUE = re.compile(r'^[A-Z]\s+')  # "M Something", "S Something"
 
     def _summary(start_li: int, end_li: int) -> str:
-        """Extract first meaningful sentence from the section's content lines."""
-        for li in range(start_li + 1, min(end_li, start_li + 30)):
+        """Return the first ~7 words of actual speech content after the section header."""
+        for li in range(start_li + 1, min(end_li, start_li + 45)):
             text = lines[li].strip().rstrip('\r\n')
             if not text:
                 continue
-            if (_NOISE.match(text) or _BULLET.match(text) or _STAGE_DIR.match(text)
+            if (_NOISE.match(text) or _STAGE_DIR.match(text)
                     or _is_caps_line(text) or _SINGLE_LETTER_CUE.match(text)):
                 continue
-            # Stop at next speaker cue
+            # Skip internal speaker cues — look past them to find speech text
             if _SPEAKER.match(text):
-                break
-            sentence = re.split(r'(?<=[.!?])\s', text)[0].strip()
-            if len(sentence) >= 10:
-                return (sentence[:110] + "…") if len(sentence) > 110 else sentence
+                continue
+            # Strip bullet prefix to get the speech content
+            text = re.sub(r'^[●•○■◆\-]\s*', '', text).strip()
+            if not text or len(text) < 8:
+                continue
+            word_list = text.split()
+            snippet = ' '.join(word_list[:7])
+            if len(word_list) > 7:
+                snippet += '…'
+            return snippet
         return ""
 
     def _add(sections, li, title, end_li):

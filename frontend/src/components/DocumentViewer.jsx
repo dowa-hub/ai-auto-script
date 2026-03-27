@@ -294,8 +294,42 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
       }
     }
 
+    // ── Pass 2: re-map section anchor lines using direct title-text search ───
+    // The sequential pointer can drift when cue/lighting column lines advance
+    // it past a section header. Re-map every section's line_index by searching
+    // the section TITLE text directly in the PDF rows (no pointer dependency).
+    // Uses bigram matching: first two title words must appear in the same row.
+    if (scriptData.sections?.length) {
+      for (const sec of scriptData.sections) {
+        const li  = sec.line_index
+        const pg  = hasPageInfo ? (linePagesMap[li] ?? 0) : 0
+        const titleClean = sec.title.toLowerCase().replace(/[^\w\s]/g, '').trim()
+        const tWords = titleClean.split(/\s+/).filter(w => w.length > 1)
+        if (!tWords.length) continue
+        const t0 = tWords[0]   // usually the timestamp
+        const t1 = tWords[1]   // usually the speaker name
+        const pageRows = rowsByPage[pg] || []
+        for (const { rowIdx, words } of pageRows) {
+          const i0 = words.findIndex(w =>
+            w === t0 || (t0.length >= 4 && w.length >= 4 && t0.slice(0, 4) === w.slice(0, 4))
+          )
+          if (i0 === -1) continue
+          if (t1) {
+            // Second word must appear within 4 positions of the first
+            const nearby = words.slice(i0, i0 + 5)
+            const ok = nearby.some(w =>
+              w === t1 || (t1.length >= 4 && w.length >= 4 && t1.slice(0, 4) === w.slice(0, 4))
+            )
+            if (!ok) continue
+          }
+          mapping[li] = rowIdx   // override sequential result
+          break
+        }
+      }
+    }
+
     lineToPdfRow.current = mapping
-    console.log(`[PDF] Built line mapping: ${Object.keys(mapping).length}/${scriptData.lines.length} lines mapped`)
+    console.log(`[PDF] Built line mapping: ${Object.keys(mapping).length}/${scriptData.lines.length} lines mapped, ${scriptData.sections?.length ?? 0} sections re-anchored`)
   }
 
   function highlightPdfByText(lineIdx) {
