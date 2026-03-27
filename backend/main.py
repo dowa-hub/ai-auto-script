@@ -13,23 +13,17 @@ from fastapi.responses import FileResponse, Response, HTMLResponse
 
 from ingestion.parser import parse_unified
 from tracker import ScriptTracker
-from stt.offline import OfflineSTT
 from stt.cloud import CloudSTT
 
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-STT_MODE = os.getenv("STT_MODE", "offline")
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base.en")
 DEEPGRAM_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 
 # Audio processing constants (16kHz mono from browser)
 SAMPLE_RATE = 16000
 CHUNK_SAMPLES = 4000          # 250ms per chunk
-PROCESS_EVERY_N = 3           # trigger check every N chunks (0.75s)
-CONTEXT_CHUNKS  = 8           # transcribe last N chunks (2s) — short = fast
-SCAN_CHUNKS     = 20          # longer clip (5s) used in scan mode for accuracy
 MAX_BUFFER_CHUNKS = 120       # keep last 30s of audio
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -47,38 +41,16 @@ app.add_middleware(
 
 current_script = None       # type: dict
 tracker = None              # type: ScriptTracker
-stt_engine = None           # type: OfflineSTT | CloudSTT
+stt_engine = None           # type: CloudSTT
 current_file_bytes = None   # raw uploaded file bytes
 current_file_name = None    # original filename
 current_html = None         # pre-built display HTML (same line numbering as word list)
 model_ready = False
-_init_task = None           # background startup task — cancelled on settings change
-
-
-async def build_stt(mode: str, status_cb=None):
-    if mode == "cloud":
-        engine = CloudSTT(api_key=DEEPGRAM_KEY)
-        await engine.initialize(status_callback=status_cb)
-    else:
-        engine = OfflineSTT(model_size=WHISPER_MODEL)
-        await engine.initialize(status_callback=status_cb)
-    return engine
 
 
 @app.on_event("startup")
 async def startup():
-    global _init_task
     _load_script_cache()  # restore last uploaded script
-    _init_task = asyncio.create_task(_init_stt_background())
-
-
-async def _init_stt_background():
-    global stt_engine, model_ready
-    try:
-        stt_engine = await build_stt(STT_MODE)
-        model_ready = True
-    except Exception as e:
-        print(f"[STT] Failed to initialize: {e}")
 
 
 # ── REST endpoints ─────────────────────────────────────────────────────────────
@@ -160,8 +132,6 @@ async def get_script():
 async def get_status():
     return {
         "model_ready": model_ready,
-        "stt_mode": STT_MODE,
-        "whisper_model": WHISPER_MODEL,
         "has_script": current_script is not None,
         "position": tracker.position if tracker else 0,
     }
@@ -169,20 +139,15 @@ async def get_status():
 
 @app.post("/api/settings")
 async def update_settings(body: dict):
-    global stt_engine, model_ready, STT_MODE, WHISPER_MODEL, DEEPGRAM_KEY, _init_task
-    # Cancel the background startup task so it can't overwrite our new engine
-    if _init_task and not _init_task.done():
-        _init_task.cancel()
-    if "stt_mode" in body:
-        STT_MODE = body["stt_mode"]
-    if "whisper_model" in body:
-        WHISPER_MODEL = body["whisper_model"]
+    global stt_engine, model_ready, DEEPGRAM_KEY
     if "deepgram_key" in body and body["deepgram_key"]:
         DEEPGRAM_KEY = body["deepgram_key"]   # memory only — never written to disk
     model_ready = False
-    stt_engine = await build_stt(STT_MODE)
+    engine = CloudSTT(api_key=DEEPGRAM_KEY)
+    await engine.initialize()
+    stt_engine = engine
     model_ready = True
-    return {"ok": True, "stt_mode": STT_MODE}
+    return {"ok": True}
 
 
 @app.post("/api/seek")
@@ -216,7 +181,6 @@ async def audio_ws(websocket: WebSocket):
 
     audio_buffer: list[np.ndarray] = []
     chunk_count    = 0
-    is_transcribing = False   # offline only: skip trigger if one is already running
 
     async def send(data: dict):
         try:
@@ -260,31 +224,15 @@ async def audio_ws(websocket: WebSocket):
             from tracker import log as tlog
             tlog.debug(f"[MISS]  \"{transcript}\" → pos stays {position}, buf={tracker._buffer[-5:]}")
 
-    async def run_offline():
-        """Transcribe from buffer and dispatch. Runs in background task."""
-        nonlocal is_transcribing
-        try:
-            context    = np.concatenate(audio_buffer[-CONTEXT_CHUNKS:])
-            transcript = await stt_engine.transcribe(context)
-            if transcript:
-                await dispatch(transcript)
-            else:
-                await send({"type": "silence"})
-        except Exception:
-            pass
-        finally:
-            is_transcribing = False
-
-    # Connect Deepgram if in cloud mode
-    is_cloud = STT_MODE == "cloud" and isinstance(stt_engine, CloudSTT)
-    if is_cloud:
+    # Connect Deepgram
+    if stt_engine:
         try:
             await stt_engine.connect()
             await send({"type": "stt_status", "engine": "deepgram", "connected": True, "model": "Nova-3"})
         except Exception as e:
             await send({"type": "stt_status", "engine": "deepgram", "connected": False, "error": str(e)})
     else:
-        await send({"type": "stt_status", "engine": "whisper", "connected": True, "model": WHISPER_MODEL})
+        await send({"type": "stt_status", "engine": "deepgram", "connected": False, "error": "No API key set"})
 
     await send({"type": "model_status", "status": "ready" if model_ready else "loading"})
 
@@ -301,26 +249,18 @@ async def audio_ws(websocket: WebSocket):
             if not model_ready or not stt_engine:
                 continue
 
-            if is_cloud:
-                # ── Cloud path: pipe every chunk to Deepgram, get transcripts back ──
-                await stt_engine.send_chunk(chunk)
-                # Show interim (partial) results live
-                interim = stt_engine.peek_interim()
-                if interim:
-                    await send({"type": "transcript", "text": interim})
-                # Feed final words to the tracker
-                final = stt_engine.pop_transcript()
-                if final:
-                    await dispatch(final)
-
-            else:
-                # ── Offline path: batch every N chunks, skip if already running ──
-                if chunk_count % PROCESS_EVERY_N == 0 and not is_transcribing:
-                    is_transcribing = True
-                    asyncio.create_task(run_offline())
+            await stt_engine.send_chunk(chunk)
+            # Show interim (partial) results live
+            interim = stt_engine.peek_interim()
+            if interim:
+                await send({"type": "transcript", "text": interim})
+            # Feed final words to the tracker
+            final = stt_engine.pop_transcript()
+            if final:
+                await dispatch(final)
 
     except WebSocketDisconnect:
-        if is_cloud:
+        if stt_engine:
             await stt_engine.close()
 
 

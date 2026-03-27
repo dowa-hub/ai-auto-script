@@ -13,8 +13,6 @@ export default function App() {
   const [confidence,  setConfidence]  = useState(0)
   const [transcript,  setTranscript]  = useState('')
   const [locked,      setLocked]      = useState(false)
-  const [sttMode,     setSttMode]     = useState('offline')
-  const [whisperModel,setWhisperModel]= useState('base.en')
 
   // ── WebSocket ──────────────────────────────────────────────────────────────
   const onMessage = useCallback((msg) => {
@@ -69,14 +67,11 @@ export default function App() {
   }
 
   async function handleSettingsChange(changes) {
-    if (changes.stt_mode)      setSttMode(changes.stt_mode)
-    if (changes.whisper_model) setWhisperModel(changes.whisper_model)
     await fetch('/api/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(changes),
     })
-    // Reconnect WebSocket so the new STT engine/mode takes effect immediately
     reconnect()
   }
 
@@ -98,8 +93,6 @@ export default function App() {
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         <Sidebar
           onScriptLoaded={(data, name) => { setScript(data); setFileInfo({ name }) }}
-          sttMode={sttMode}
-          whisperModel={whisperModel}
           onSettingsChange={handleSettingsChange}
           sttStatus={sttStatus}
         />

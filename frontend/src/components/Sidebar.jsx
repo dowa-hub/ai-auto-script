@@ -1,7 +1,7 @@
 import { useState, useRef } from 'react'
 import FileUpload from './FileUpload.jsx'
 
-export default function Sidebar({ onScriptLoaded, sttMode, whisperModel, onSettingsChange, sttStatus }) {
+export default function Sidebar({ onScriptLoaded, onSettingsChange, sttStatus }) {
   const [dgKey, setDgKey]       = useState('')
   const [connecting, setConn]   = useState(false)
   const inputRef                = useRef(null)
@@ -9,13 +9,9 @@ export default function Sidebar({ onScriptLoaded, sttMode, whisperModel, onSetti
   async function connectDeepgram() {
     if (!dgKey.trim()) return
     setConn(true)
-    await onSettingsChange({ stt_mode: 'cloud', deepgram_key: dgKey.trim() })
+    await onSettingsChange({ deepgram_key: dgKey.trim() })
     setDgKey('')        // clear from UI immediately — never lingers
     setConn(false)
-  }
-
-  async function disconnectDeepgram() {
-    await onSettingsChange({ stt_mode: 'offline' })
   }
 
   const dgConnected = sttStatus?.engine === 'deepgram' && sttStatus?.connected
@@ -43,18 +39,12 @@ export default function Sidebar({ onScriptLoaded, sttMode, whisperModel, onSetti
           <div style={{
             background: 'rgba(33,150,243,0.1)', border: '1px solid rgba(33,150,243,0.3)',
             borderRadius: 6, padding: '8px 12px', marginBottom: 8,
-            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            display: 'flex', alignItems: 'center',
           }}>
             <span style={{ fontSize: 12, color: '#64b5f6', display: 'flex', alignItems: 'center', gap: 6 }}>
               <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#4caf50', display: 'inline-block' }} />
               Deepgram Nova-3 live
             </span>
-            <button
-              onClick={disconnectDeepgram}
-              style={{ background: 'transparent', color: 'var(--text-dim)', fontSize: 11, padding: '2px 6px', border: '1px solid var(--border)' }}
-            >
-              Disconnect
-            </button>
           </div>
         ) : (
           // Paste key + connect
@@ -88,25 +78,6 @@ export default function Sidebar({ onScriptLoaded, sttMode, whisperModel, onSetti
           </>
         )}
 
-        {/* ── Whisper section ── */}
-        <Label style={{ marginTop: 14 }}>Whisper (offline)</Label>
-        <select
-          value={whisperModel}
-          onChange={e => onSettingsChange({ whisper_model: e.target.value, stt_mode: 'offline' })}
-          disabled={dgConnected}
-          style={{ width: '100%' }}
-          title={dgConnected ? 'Disconnect Deepgram to use Whisper' : ''}
-        >
-          <option value="tiny.en">tiny.en — fastest</option>
-          <option value="base.en">base.en — balanced</option>
-          <option value="small.en">small.en — better</option>
-          <option value="medium.en">medium.en — best</option>
-        </select>
-        {dgConnected && (
-          <p style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 4 }}>
-            Disconnect Deepgram to switch to offline
-          </p>
-        )}
       </Section>
 
       <Section title="Tips">
@@ -114,7 +85,7 @@ export default function Sidebar({ onScriptLoaded, sttMode, whisperModel, onSetti
           <li>Click any line to jump there manually</li>
           <li>Auto-tracking resumes after 4s</li>
           <li>Amber = AI tracking · Blue = manual lock</li>
-          <li>Deepgram key is never stored to disk</li>
+          <li>API key is never stored to disk</li>
         </ul>
       </Section>
     </div>
