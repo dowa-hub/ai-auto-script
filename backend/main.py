@@ -85,10 +85,15 @@ def _load_script_cache():
             print(f"[Cache] Failed to restore script: {e}")
 
 
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
 @app.post("/api/upload-script")
 async def upload_script(file: UploadFile = File(...)):
     global current_script, tracker, current_file_bytes, current_file_name, current_html
     content = await file.read()
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File too large — 50 MB max")
     try:
         data = parse_unified(content, file.filename)
     except Exception as e:

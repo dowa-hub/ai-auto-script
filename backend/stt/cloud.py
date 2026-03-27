@@ -27,6 +27,10 @@ DEEPGRAM_URL = (
 )
 
 
+MAX_RECONNECT_ATTEMPTS = 8
+RECONNECT_BASE_DELAY   = 1.0   # seconds — doubles each attempt, caps at 30s
+
+
 class CloudSTT:
     def __init__(self, api_key: str):
         self.api_key  = api_key
@@ -37,6 +41,8 @@ class CloudSTT:
         self._lock              = asyncio.Lock()
         self._task              = None
         self._keepalive_task    = None
+        self._reconnecting      = False
+        self._closed            = False  # set True on intentional close
 
     async def initialize(self, status_callback=None):
         if not self.api_key:
@@ -48,11 +54,15 @@ class CloudSTT:
 
     async def connect(self):
         """Open the persistent WebSocket to Deepgram. Call once when listening starts."""
+        self._closed = False
+        await self._open_ws()
+        self._task           = asyncio.create_task(self._receive_loop())
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+
+    async def _open_ws(self):
         headers = {"Authorization": f"Token {self.api_key}"}
         ssl_ctx = ssl.create_default_context(cafile=certifi.where())
         self._ws = await websockets.connect(DEEPGRAM_URL, extra_headers=headers, ssl=ssl_ctx)
-        self._task           = asyncio.create_task(self._receive_loop())
-        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
     async def _keepalive_loop(self):
         """Send a KeepAlive ping every 8s so Deepgram doesn't close idle connections."""
@@ -65,29 +75,49 @@ class CloudSTT:
             pass
 
     async def _receive_loop(self):
-        """Background task — reads transcripts from Deepgram as they arrive."""
-        try:
-            async for message in self._ws:
-                data = json.loads(message)
-                if data.get("type") != "Results":
-                    continue
-                text = (
-                    data.get("channel", {})
-                    .get("alternatives", [{}])[0]
-                    .get("transcript", "")
-                    .strip()
-                )
-                if not text:
-                    continue
-                is_final = data.get("is_final", False)
-                async with self._lock:
-                    if is_final:
-                        self._pending.append(text)
-                        self._interim_text = ""
-                    else:
-                        self._interim_text = text
-        except Exception:
-            pass
+        """Background task — reads transcripts from Deepgram, reconnects on drop."""
+        attempt = 0
+        while not self._closed:
+            try:
+                async for message in self._ws:
+                    attempt = 0   # reset backoff on successful message
+                    data = json.loads(message)
+                    if data.get("type") != "Results":
+                        continue
+                    text = (
+                        data.get("channel", {})
+                        .get("alternatives", [{}])[0]
+                        .get("transcript", "")
+                        .strip()
+                    )
+                    if not text:
+                        continue
+                    is_final = data.get("is_final", False)
+                    async with self._lock:
+                        if is_final:
+                            self._pending.append(text)
+                            self._interim_text = ""
+                        else:
+                            self._interim_text = text
+            except Exception:
+                pass
+
+            if self._closed:
+                break
+
+            # Connection dropped — reconnect with exponential backoff
+            if attempt >= MAX_RECONNECT_ATTEMPTS:
+                print("[Deepgram] Max reconnect attempts reached — giving up")
+                break
+            delay = min(RECONNECT_BASE_DELAY * (2 ** attempt), 30)
+            attempt += 1
+            print(f"[Deepgram] Connection lost — reconnecting in {delay:.0f}s (attempt {attempt})")
+            await asyncio.sleep(delay)
+            try:
+                await self._open_ws()
+                print("[Deepgram] Reconnected")
+            except Exception as e:
+                print(f"[Deepgram] Reconnect failed: {e}")
 
     async def send_chunk(self, audio_int16: np.ndarray):
         """Pipe a raw PCM int16 chunk straight to Deepgram."""
@@ -110,6 +140,7 @@ class CloudSTT:
         return self._interim_text
 
     async def close(self):
+        self._closed = True
         if self._keepalive_task:
             self._keepalive_task.cancel()
         if self._task:
@@ -120,8 +151,3 @@ class CloudSTT:
             except Exception:
                 pass
 
-    # Compatibility shim so the offline code path can call transcribe() on either engine
-    async def transcribe(self, audio_int16: np.ndarray) -> str:
-        await self.send_chunk(audio_int16)
-        await asyncio.sleep(0.35)      # give Deepgram time to respond
-        return self.pop_transcript()
