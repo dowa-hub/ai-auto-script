@@ -128,11 +128,12 @@ class CloudSTT:
                 pass
 
     def pop_transcript(self) -> str:
-        """Non-blocking drain — returns final transcripts for position tracking."""
+        """Non-blocking drain — returns final transcripts for position tracking.
+        Safe to call from the main task; _pending is only mutated under _lock
+        in the receive loop, and asyncio is cooperative so this swap is atomic."""
         if not self._pending:
             return ""
-        items = self._pending[:]
-        self._pending.clear()
+        items, self._pending = self._pending, []
         return " ".join(items)
 
     def peek_interim(self) -> str:

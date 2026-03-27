@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 
-const WS_URL = 'ws://localhost:8000/ws/audio'
+const WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/audio`
 const RECONNECT_DELAY = 2000
 
 /**

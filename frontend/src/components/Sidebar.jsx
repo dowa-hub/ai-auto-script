@@ -35,9 +35,14 @@ export default function Sidebar({ onScriptLoaded, onSettingsChange, sttStatus, s
   async function connectDeepgram() {
     if (!dgKey.trim()) return
     setConn(true)
-    await onSettingsChange({ deepgram_key: dgKey.trim() })
-    setDgKey('')
-    setConn(false)
+    try {
+      await onSettingsChange({ deepgram_key: dgKey.trim() })
+      setDgKey('')
+    } catch {
+      setUploadErr('Connection failed — check your key')
+    } finally {
+      setConn(false)
+    }
   }
 
   return (

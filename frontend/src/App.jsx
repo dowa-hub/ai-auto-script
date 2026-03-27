@@ -48,34 +48,37 @@ export default function App() {
   // ── Operator controls ──────────────────────────────────────────────────────
   async function handleSeek(wordIndex) {
     setLocked(true)
-    await fetch('/api/seek', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ word_index: wordIndex }),
-    })
-    // Update line display immediately
-    if (script) {
-      const word = script.words[wordIndex]
-      if (word) setCurrentLine(word.line_index)
-    }
+    try {
+      await fetch('/api/seek', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ word_index: wordIndex }),
+      })
+      if (script) {
+        const word = script.words[wordIndex]
+        if (word) setCurrentLine(word.line_index)
+      }
+    } catch { setLocked(false) }
   }
 
   async function handleSectionSeek(wordIndex) {
     setLocked(true)
-    await fetch('/api/seek-confirmed', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ word_index: wordIndex }),
-    })
-    if (script) {
-      const word = script.words[wordIndex]
-      if (word) setCurrentLine(word.line_index)
-    }
+    try {
+      await fetch('/api/seek-confirmed', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ word_index: wordIndex }),
+      })
+      if (script) {
+        const word = script.words[wordIndex]
+        if (word) setCurrentLine(word.line_index)
+      }
+    } catch { setLocked(false) }
   }
 
   async function handleResume() {
     setLocked(false)
-    await fetch('/api/resume', { method: 'POST' })
+    try { await fetch('/api/resume', { method: 'POST' }) } catch {}
   }
 
   async function handleReset() {
@@ -84,15 +87,16 @@ export default function App() {
     setConfidence(0)
     setTranscript('')
     setTrackerStatus({ state: 'idle', confidence: 0, missCount: 0 })
-    await fetch('/api/reset', { method: 'POST' })
+    try { await fetch('/api/reset', { method: 'POST' }) } catch {}
   }
 
   async function handleSettingsChange(changes) {
-    await fetch('/api/settings', {
+    const res = await fetch('/api/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(changes),
     })
+    if (!res.ok) throw new Error('Settings update failed')
     reconnect()
   }
 
@@ -114,7 +118,7 @@ export default function App() {
       {/* Main area: sidebar + script */}
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         <Sidebar
-          onScriptLoaded={(data, name) => { setScript(data); setFileInfo({ name }); setSections(data.sections ?? []) }}
+          onScriptLoaded={(data, name) => { setScript(data); setFileInfo({ name, ts: Date.now() }); setSections(data.sections ?? []) }}
           onSettingsChange={handleSettingsChange}
           sttStatus={sttStatus}
           sections={sections}

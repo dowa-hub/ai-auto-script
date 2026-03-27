@@ -53,17 +53,26 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
   const lineToPdfRow   = useRef({})     // backend line_index → PDF row index (built once at load)
   const pageYOffsets   = useRef([])     // [topY] per 0-based page index
   const rowToPage      = useRef([])     // PDF row index → 0-based page number
+  const pdfDocRef      = useRef(null)   // PDF.js document — destroyed on re-upload
 
   const [mode, setMode]           = useState(null)  // 'pdf' | 'html' | 'image' | null
   const [htmlContent, setHtml]    = useState('')
   const [loading, setLoading]     = useState(false)
   const [error, setError]         = useState('')
+  const [loadCount, setLoadCount] = useState(0)    // increments on every upload
 
   // ── Load document whenever a new file is uploaded ─────────────────────────
   useEffect(() => {
     if (!fileInfo?.name) return
+    setLoadCount(c => c + 1)
     load(fileInfo)
-  }, [fileInfo?.name])
+    return () => {
+      if (pdfDocRef.current) {
+        pdfDocRef.current.destroy()
+        pdfDocRef.current = null
+      }
+    }
+  }, [fileInfo])
 
   async function load({ name }) {
     const ext = name.split('.').pop().toLowerCase()
@@ -112,7 +121,9 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
   async function renderPdf() {
     const lib  = await getPdfjs()
     const buf  = await fetch('/api/document/raw').then(r => r.arrayBuffer())
+    if (pdfDocRef.current) pdfDocRef.current.destroy()
     const pdf  = await lib.getDocument({ data: buf }).promise
+    pdfDocRef.current = pdf
     const inner = innerRef.current
     if (!inner) return
 

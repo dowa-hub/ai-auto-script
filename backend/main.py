@@ -1,4 +1,3 @@
-import asyncio
 import json
 import os
 import numpy as np
@@ -9,7 +8,7 @@ import mimetypes
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, Response, HTMLResponse
+from fastapi.responses import Response, HTMLResponse
 
 from ingestion.parser import parse_unified
 from tracker import ScriptTracker, log as tracker_log
@@ -21,10 +20,7 @@ load_dotenv()
 
 DEEPGRAM_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 
-# Audio processing constants (16kHz mono from browser)
-SAMPLE_RATE = 16000
-CHUNK_SAMPLES = 4000          # 250ms per chunk
-MAX_BUFFER_CHUNKS = 120       # keep last 30s of audio
+SAMPLE_RATE = 16000  # 16kHz mono from browser
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
@@ -148,6 +144,8 @@ async def update_settings(body: dict):
     if "deepgram_key" in body and body["deepgram_key"]:
         DEEPGRAM_KEY = body["deepgram_key"]   # memory only — never written to disk
     model_ready = False
+    if stt_engine:
+        await stt_engine.close()
     engine = CloudSTT(api_key=DEEPGRAM_KEY)
     await engine.initialize()
     stt_engine = engine
@@ -193,9 +191,6 @@ async def reset():
 async def audio_ws(websocket: WebSocket):
     await websocket.accept()
 
-    audio_buffer: list[np.ndarray] = []
-    chunk_count    = 0
-
     async def send(data: dict):
         try:
             await websocket.send_text(json.dumps(data))
@@ -208,7 +203,7 @@ async def audio_ws(websocket: WebSocket):
             return
         # Always show what was heard
         await send({"type": "transcript", "text": transcript})
-        if not tracker or not current_script:
+        if not tracker or not current_script or not current_script["words"]:
             return
 
         old_pos = tracker.position
@@ -231,7 +226,10 @@ async def audio_ws(websocket: WebSocket):
             return
 
         # Good match — move cursor and send position
-        lookahead = min(position + 3, len(current_script["words"]) - 1)
+        n_words = len(current_script["words"])
+        if position >= n_words:
+            return
+        lookahead = min(position + 3, n_words - 1)
         display_line = current_script["words"][lookahead]["line_index"]
         current_line = current_script["words"][position]["line_index"]
         ctx_s = max(0, position - 2)
@@ -263,11 +261,6 @@ async def audio_ws(websocket: WebSocket):
         while True:
             data  = await websocket.receive_bytes()
             chunk = np.frombuffer(data, dtype=np.int16).copy()
-            audio_buffer.append(chunk)
-            chunk_count += 1
-
-            if len(audio_buffer) > MAX_BUFFER_CHUNKS:
-                audio_buffer.pop(0)
 
             if not model_ready or not stt_engine:
                 continue
@@ -283,24 +276,12 @@ async def audio_ws(websocket: WebSocket):
                 await dispatch(final)
 
     except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[WS] Error in audio handler: {e}")
+    finally:
         if stt_engine:
             await stt_engine.close()
-
-
-async def _claude_fallback(send, transcript: str):
-    if not tracker:
-        return
-    position, confidence = await tracker.claude_recovery(transcript)
-    if current_script:
-        current_line = current_script["words"][position]["line_index"]
-        await send({
-            "type": "position",
-            "word_index": position,
-            "line_index": current_line,
-            "confidence": round(confidence, 2),
-            "transcript": transcript,
-            "recovered": True,
-        })
 
 
 # ── Serve built frontend (production) ─────────────────────────────────────────

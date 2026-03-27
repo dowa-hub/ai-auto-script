@@ -148,7 +148,8 @@ def _pdf_parse(content: bytes) -> dict:
 
         text = "\n".join(pages)
         if len(text.strip()) < 100:
-            text = _ocr_pdf(content)
+            # OCR fallback — treat entire result as a single "page"
+            pages = [_ocr_pdf(content)]
     except Exception as e:
         raise ValueError(f"PDF parse failed: {e}")
 
