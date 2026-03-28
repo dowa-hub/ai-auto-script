@@ -170,76 +170,259 @@ def _pdf_parse(content: bytes) -> dict:
     result = _result(lines, words, None)  # HTML=None → PDF.js handles display
     result["line_pages"] = line_pages
 
-    # For table-format PDFs, re-detect sections from FULL page text so that
-    # timestamps in the Time column appear in section titles (e.g. "5:15PM Kelly Russell:")
+    # For table-format PDFs, detect sections by scanning the Time column
+    # for timestamps and matching them to Script column content at the same
+    # vertical position. This is structural (not text-heuristic) so it handles
+    # any Script column content regardless of starting character (#, ●, etc.)
     if script_col:
-        result["sections"] = _sections_from_full_pages(
-            full_pages, lines, words, line_pages
-        )
+        cell_sections = _detect_table_cells(pdf, script_col, words, line_pages, lines)
+        result["sections"] = cell_sections if cell_sections else _detect_sections(lines, words)
 
     return result
 
 
-def _sections_from_full_pages(full_pages, script_lines, script_words, line_pages):
-    """Detect sections from full-page text (includes Time column timestamps),
-    then remap each section's word_index to the script-column word list."""
-    full_lines, full_words = [], []
-    full_line_pages: dict[int, int] = {}
-    for page_num, page_text in enumerate(full_pages):
-        for raw in page_text.split("\n"):
-            if raw.strip():
-                li = _add_line(full_lines, full_words, raw)
-                full_line_pages[li] = page_num
+def _detect_table_cells(pdf, script_col, script_words, line_pages, script_lines):
+    """Detect sections from table-format PDFs by y-position matching.
 
-    full_sections = _detect_sections(full_lines, full_words)
-    if not full_sections:
-        return _detect_sections(script_lines, script_words)  # fallback
+    Scans the Time column for timestamps and pairs each with the Script column
+    text at the same vertical position on the page. Structural approach — no
+    text-pattern heuristics, works for any Script content (#1 Video, ●, etc.).
 
-    # Build per-page word index for script-column (page → [(word_idx, clean)])
-    script_words_by_page: dict[int, list] = {}
-    for wi, w in enumerate(script_words):
-        pg = line_pages.get(w["line_index"], 0)
-        script_words_by_page.setdefault(pg, []).append((wi, w["clean"]))
+    Pages without any timestamp in the Time column are skipped (they are
+    continuations of the previous section, not new sections).
+    """
+    left_x, right_x = script_col
 
-    _TS_PREFIX = re.compile(
-        r'^(\d{1,2}:\d{2}(?:\s*[ap]m)?|\d{3,4}[ap]|\d{1,2}[ap]m?)\s+',
+    _TS_ANY = re.compile(
+        r'(\d{1,2}:\d{2}\s*[ap]m|\d{1,2}:\d{2}|\d{1,2}[ap]m)',
         re.IGNORECASE,
     )
+    # Skip page-header / column-header rows that repeat on every page
+    _SKIP_RE = re.compile(
+        r'^(Time\s*$|Script\s*$|Virtual|Cue|NOTE\b|AV\s*Team|Projection)',
+        re.IGNORECASE,
+    )
+    # Stage-note content after timestamps — NOT real sections
+    _STAGE_NOTE = re.compile(r'^(?:From\s+\w|Notes?:|TBD\b|N/A\b)', re.IGNORECASE)
 
-    remapped = []
-    for sec in full_sections:
-        pg = full_line_pages.get(sec["line_index"], 0)
-        # Strip timestamp prefix to isolate speaker/section name
-        name_part = _TS_PREFIX.sub("", sec["title"]).strip().rstrip(":")
-        key_words  = [w for w in re.findall(r"[A-Za-z]{3,}", name_part)][:2]
+    # Per-page script word lists in document order
+    page_word_lists = {}
+    for wi, w in enumerate(script_words):
+        pg = line_pages.get(w["line_index"], 0)
+        page_word_lists.setdefault(pg, []).append((wi, w))
 
-        word_idx = None
-        if key_words and pg in script_words_by_page:
-            key0 = key_words[0].lower()
-            key1 = key_words[1].lower() if len(key_words) > 1 else None
-            page_wds = script_words_by_page[pg]
-            for i, (wi, clean) in enumerate(page_wds):
-                if clean == key0 or (len(key0) >= 4 and clean.startswith(key0[:4])):
-                    if key1:
-                        # key1 must also appear within the next 4 words on the same page
-                        nearby = [c for _, c in page_wds[i + 1: i + 5]]
-                        if not any(
-                            c == key1 or (len(key1) >= 4 and c.startswith(key1[:4]))
-                            for c in nearby
-                        ):
-                            continue
-                    word_idx = wi
+    def _table_y_bounds(page):
+        """Return (y_min, y_max) of the table content area using drawn H-lines."""
+        hs = []
+        for obj in page.get_objects():
+            if obj.type == 2:
+                l, b, r, t = obj.get_pos()
+                if (t - b) < 3 and (r - l) > 200:
+                    hs.append(b)
+        if len(hs) >= 2:
+            return min(hs) + 2, max(hs) - 2
+        return 50, page.get_height() - 50
+
+    def _merge_char_rows(char_map, gap=20):
+        """Merge y-adjacent character groups into text rows [(y_top, text)]."""
+        rows = []
+        group_y, group_chars = None, []
+        for y in sorted(char_map.keys(), reverse=True):
+            if group_y is None or group_y - y > gap:
+                if group_chars:
+                    text = "".join(c for _, c in sorted(group_chars, key=lambda t: t[0]))
+                    rows.append((group_y, text.strip()))
+                group_y = y
+                group_chars = list(char_map[y])
+            else:
+                group_chars.extend(char_map[y])
+        if group_chars:
+            text = "".join(c for _, c in sorted(group_chars, key=lambda t: t[0]))
+            rows.append((group_y, text.strip()))
+        return rows
+
+    def _find_word_idx(pg_wds, script_text, used):
+        """First unused page word matching first two alpha words of script_text."""
+        alpha = re.findall(r"[A-Za-z]{2,}", script_text)
+        key0 = alpha[0].lower() if alpha else ""
+        key1 = alpha[1].lower() if len(alpha) > 1 else None
+
+        def _m(clean, key):
+            return clean == key or (len(key) >= 3 and clean.startswith(key[:min(len(key), 4)]))
+
+        for i, (wi, w) in enumerate(pg_wds):
+            if wi in used or not key0 or not _m(w["clean"], key0):
+                continue
+            if key1:
+                nearby = [pw["clean"] for _, pw in pg_wds[i+1:i+5]]
+                # key1 may be embedded in the matched word (e.g. "postevent" contains "event")
+                if key1 not in w["clean"] and not any(_m(c, key1) for c in nearby):
+                    continue
+            return wi, w["line_index"]
+        for wi, w in pg_wds:  # fallback: first unused
+            if wi not in used:
+                return wi, w["line_index"]
+        return None, None
+
+    def _make_summary(start_wi):
+        """First ~7 speech words after start_wi, skipping speaker-cue lines."""
+        _SP = re.compile(r'^[A-Z][a-zA-Z\-]+(?: [A-Z][a-zA-Z\-]+){0,3}:\s*$')
+        i = start_wi
+        while i < min(start_wi + 80, len(script_words)):
+            li = script_words[i]["line_index"]
+            line_wds = []
+            j = i
+            while j < len(script_words) and script_words[j]["line_index"] == li:
+                line_wds.append(script_words[j]["word"])
+                j += 1
+            line_text = " ".join(line_wds).strip()
+            # Strip the same column-bleed prefixes that title stripping handles
+            line_text = re.sub(r'^(?:PM?|AM|MC)\s+', '', line_text)
+            line_text = re.sub(r'^[A-Z]\s*[–—\-]\s*', '', line_text)  # "H — Gathering" → "Gathering"
+            line_text = re.sub(r'^[A-Z]\s+', '', line_text)            # "M Poison Waters" → "Poison Waters"
+            line_text = re.sub(r'^[A-Z](?=[A-Z][a-z])', '', line_text) # "PEvent" → "Event"
+            # Skip lines starting with lowercase — truncated page headers or mid-sentence
+            # fragments (e.g. "ebrook EQUIVOX", "ational Summit")
+            if line_text and line_text[0].islower():
+                i = j
+                continue
+            # Skip column headers and AV-team noise (e.g. "Script", "Virtual Cues")
+            if line_text and _SKIP_RE.match(line_text):
+                i = j
+                continue
+            if line_text and not _SP.match(line_text):
+                snippet = line_text.split()[:7]
+                return " ".join(snippet) + ("…" if len(snippet) >= 7 else "")
+            i = j
+        return ""
+
+    sections = []
+    used_wis = set()
+
+    for pg_idx, page in enumerate(pdf):
+        tp = page.get_textpage()
+        n = tp.count_chars()
+        if n == 0:
+            continue
+
+        y_min, y_max = _table_y_bounds(page)
+
+        # Scan chars inside the table area only (excludes running page headers)
+        # Time column: x < left_x-3  (small margin avoids "M" from "PM" leaking)
+        # Script column: left_x+3 ≤ x ≤ right_x
+        # Scan Time column chars only (for timestamp y-position detection)
+        time_by_y = {}
+
+        for i in range(min(n, 12000)):
+            c = tp.get_text_range(i, 1)
+            if not c or not c.strip():
+                continue
+            try:
+                box = tp.get_charbox(i)
+                x = box[0]
+                y = (box[1] + box[3]) / 2
+            except Exception:
+                continue
+            if not (y_min < y < y_max):
+                continue          # outside table area — skip
+            if x < left_x - 3:
+                y_key = round(y / 8) * 8
+                time_by_y.setdefault(y_key, []).append((x, c))
+
+        time_rows = _merge_char_rows(time_by_y, gap=20)
+
+        # Find timestamps in Time column rows
+        ts_positions = []
+        for y, text in time_rows:
+            if _SKIP_RE.match(text):
+                continue
+            m = _TS_ANY.search(text)
+            if m:
+                ts_positions.append((y, m.group(1).strip()))
+
+        if not ts_positions:
+            continue  # pure continuation page — no new sections here
+
+        pg_wds = page_word_lists.get(pg_idx, [])
+        ts_positions.sort(key=lambda t: t[0], reverse=True)  # top → bottom
+
+        for ts_idx, (ts_y, ts_str) in enumerate(ts_positions):
+            # y-window for this cell: from ts_y down to next timestamp (or ts_y - 300)
+            y_floor = (ts_positions[ts_idx + 1][0]
+                       if ts_idx + 1 < len(ts_positions) else ts_y - 300)
+
+            # Get Script column text in this cell's y-window using get_text_bounded.
+            # This gives properly-spaced text (unlike char-by-char concatenation).
+            cell_bottom = max(y_floor - 5, y_min)
+            cell_top    = min(ts_y + 25, y_max)
+            raw_cell = tp.get_text_bounded(
+                left=left_x + 3, right=right_x,
+                bottom=cell_bottom, top=cell_top,
+            )
+            first_script = ""
+            for ln in raw_cell.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
+                ln = ln.strip()
+                # Skip boundary-artifact chars and header rows.
+                # Require at least one 4+ consecutive alpha sequence — filters "y ggg", "gpg".
+                if ln and re.search(r'[A-Za-z]{4,}', ln) and not _SKIP_RE.match(ln):
+                    first_script = ln
                     break
 
-        if word_idx is not None:
-            remapped.append({
-                "title":      sec["title"],
-                "summary":    sec["summary"],
-                "line_index": script_words[word_idx]["line_index"],
-                "word_index": word_idx,
+            # Strip leading column-indicator prefix for display and filtering.
+            # Handles: "M Poison Waters:" → "Poison Waters:"    (single-letter + space)
+            #          "PM Event Ends"   → "Event Ends"         (2-char + space)
+            #          "PDoors Open"     → "Doors Open"         (no-space bleed from PM)
+            stripped_script = re.sub(r'^(?:PM?|AM|MC)\s+', '', first_script)
+            stripped_script = re.sub(r'^[A-Z]\s+', '', stripped_script)
+            stripped_script = re.sub(r'^[A-Z](?=[A-Z][a-z])', '', stripped_script)
+
+            # Skip stage notes appearing as timestamped rows (e.g. "7:14PM M From notecards")
+            if stripped_script and _STAGE_NOTE.match(stripped_script):
+                continue
+
+            # Skip garbled/fragmented text: if alpha words average < 3.5 chars it's
+            # likely mis-detected column content (e.g. "e ecog Sayto te stage")
+            if stripped_script:
+                alpha_wds = [w for w in stripped_script.split() if w.isalpha()]
+                if len(alpha_wds) >= 2:
+                    avg_len = sum(len(w) for w in alpha_wds) / len(alpha_wds)
+                    if avg_len < 3.5:
+                        continue
+
+            # Skip mid-sentence fragments and truncated page headers: if the first
+            # alphabetic word starts lowercase it's a continuation, not a section title
+            # (e.g. "screens.", "endure.", "ational Summit", "moments with us.")
+            if stripped_script:
+                alpha_words = [w for w in stripped_script.split() if w and w[0].isalpha()]
+                if alpha_words and alpha_words[0][0].islower():
+                    continue
+
+            title = f"{ts_str}  {stripped_script}" if stripped_script else ts_str
+            if len(title) > 65:
+                title = title[:62] + "…"
+
+            wi, li = _find_word_idx(pg_wds, first_script, used_wis)
+            if wi is None:
+                continue
+
+            used_wis.add(wi)
+            sections.append({
+                "title":      title,
+                "summary":    _make_summary(wi),
+                "line_index": li,
+                "word_index": wi,
             })
 
-    return remapped if remapped else _detect_sections(script_lines, script_words)
+    if not sections:
+        return None
+
+    sections.sort(key=lambda s: s["word_index"])
+    seen, unique = set(), []
+    for s in sections:
+        if s["word_index"] not in seen:
+            seen.add(s["word_index"])
+            unique.append(s)
+    return unique
 
 
 def _detect_script_column(pdf):
@@ -439,7 +622,9 @@ def _detect_sections(lines: list, words: list) -> list:
         m = _TS.match(stripped)
         if m:
             name = m.group(2).strip()
-            if name and name[0].isupper():   # real agenda item starts uppercase
+            # Skip operational stage notes: "From notecards", "From script", "Notes:", etc.
+            _ts_stage = re.compile(r'^(?:From\s+\w|Notes?:|TBD\b|N/A\b)', re.IGNORECASE)
+            if name and name[0].isupper() and not _ts_stage.match(name):
                 timestamped_lis.append((li, m.group(1), name))
 
     if timestamped_lis:
