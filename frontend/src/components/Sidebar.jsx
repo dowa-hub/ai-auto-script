@@ -116,7 +116,7 @@ export default function Sidebar({ onScriptLoaded, onSettingsChange, sttStatus, s
             {sections.map((sec, i) => (
               <button
                 key={i}
-                onClick={() => onSectionSeek(sec.word_index)}
+                onClick={() => onSectionSeek(sec)}
                 style={{
                   width: '100%', boxSizing: 'border-box',
                   background: 'var(--surface2)',

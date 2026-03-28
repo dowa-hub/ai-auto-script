@@ -44,7 +44,7 @@ function smoothScrollTo(element, targetY, duration = 800) {
   _scrollRaf = requestAnimationFrame(step)
 }
 
-export default function DocumentViewer({ fileInfo, currentLine, locked, scriptData, onSeek }) {
+export default function DocumentViewer({ fileInfo, currentLine, locked, scriptData, onSeek, sectionTarget }) {
   const scrollRef      = useRef(null)   // outer scrollable div
   const innerRef       = useRef(null)   // inner div — PDF pages rendered here
   const highlightRef   = useRef(null)   // amber bar (PDF mode, absolutely positioned)
@@ -52,8 +52,10 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
   const pdfTextRowsRef = useRef([])     // [{text, yTop, yBot, page}] — all text rows with positions
   const lineToPdfRow   = useRef({})     // backend line_index → PDF row index (built once at load)
   const pageYOffsets   = useRef([])     // [topY] per 0-based page index
+  const pageHeights    = useRef([])     // [height] per 0-based page index (rendered pixels)
   const rowToPage      = useRef([])     // PDF row index → 0-based page number
   const pdfDocRef      = useRef(null)   // PDF.js document — destroyed on re-upload
+  const sectionSeekTs  = useRef(0)      // timestamp of last section seek (cooldown for line scroll)
 
   const [mode, setMode]           = useState(null)  // 'pdf' | 'html' | 'image' | null
   const [htmlContent, setHtml]    = useState('')
@@ -113,9 +115,35 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
   // ── Respond to tracker position updates ───────────────────────────────────
   useEffect(() => {
     if (currentLine == null) return
+    // Skip entirely if a section seek just happened — sectionTarget owns positioning
+    if (Date.now() - sectionSeekTs.current < 1500) return
     if (mode === 'pdf')  highlightPdfByText(currentLine)
     if (mode === 'html') highlightHtml(currentLine)
   }, [currentLine, mode])
+
+  // ── Direct PDF navigation from section click (bypasses word→line→row chain) ─
+  useEffect(() => {
+    if (!sectionTarget || mode !== 'pdf') return
+    const { page, pageY } = sectionTarget
+    const offset = pageYOffsets.current[page]
+    const height = pageHeights.current[page]
+    if (offset == null || !height) return
+
+    sectionSeekTs.current = Date.now()
+    const targetY = offset + pageY * height
+
+    // Position highlight bar directly at the section's PDF coordinates
+    const bar = highlightRef.current
+    if (bar) {
+      bar.style.opacity = '1'
+      bar.style.top     = (targetY - 4) + 'px'
+      bar.style.height  = '26px'
+    }
+
+    // Scroll directly to the timestamp's position in the PDF
+    const sc = scrollRef.current
+    if (sc) smoothScrollTo(sc, Math.max(0, targetY - sc.clientHeight * 0.2), 600)
+  }, [sectionTarget, mode])
 
   // ── PDF: canvas rendering ─────────────────────────────────────────────────
   async function renderPdf() {
@@ -133,6 +161,7 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
     const allLines = []
     const allTextRows = []
     const _pageYOffsets = []
+    const _pageHeights  = []
     const _rowToPage    = []
 
     for (let p = 1; p <= pdf.numPages; p++) {
@@ -143,6 +172,7 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
       const scale    = Math.min(maxW / rawVp.width, 2.2)
       const viewport = page.getViewport({ scale })
       _pageYOffsets.push(topOffset)
+      _pageHeights.push(viewport.height)
 
       // Page wrapper (white card)
       const wrap = document.createElement('div')
@@ -206,6 +236,7 @@ export default function DocumentViewer({ fileInfo, currentLine, locked, scriptDa
     pdfLinesRef.current    = allLines
     pdfTextRowsRef.current = allTextRows
     pageYOffsets.current   = _pageYOffsets
+    pageHeights.current    = _pageHeights
     rowToPage.current      = _rowToPage
 
     // Build a mapping from backend line_index → PDF row index

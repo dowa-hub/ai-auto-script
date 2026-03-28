@@ -15,6 +15,7 @@ export default function App() {
   const [transcript,     setTranscript]     = useState('')
   const [locked,         setLocked]         = useState(false)
   const [trackerStatus,  setTrackerStatus]  = useState({ state: 'idle', confidence: 0, missCount: 0 })
+  const [sectionTarget,  setSectionTarget]  = useState(null)  // { page, pageY, key } for direct PDF nav
 
   // ── WebSocket ──────────────────────────────────────────────────────────────
   const onMessage = useCallback((msg) => {
@@ -61,16 +62,21 @@ export default function App() {
     } catch { setLocked(false) }
   }
 
-  async function handleSectionSeek(wordIndex) {
+  async function handleSectionSeek(section) {
     setLocked(true)
     try {
       await fetch('/api/seek-confirmed', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ word_index: wordIndex }),
+        body: JSON.stringify({ word_index: section.word_index }),
       })
+      // Direct PDF navigation using stored page coordinates (bypasses word→line→row chain)
+      if (section.page != null && section.page_y != null) {
+        setSectionTarget({ page: section.page, pageY: section.page_y, key: Date.now() })
+      }
+      // Also set currentLine for highlight bar and status display
       if (script) {
-        const word = script.words[wordIndex]
+        const word = script.words[section.word_index]
         if (word) setCurrentLine(word.line_index)
       }
     } catch { setLocked(false) }
@@ -131,6 +137,7 @@ export default function App() {
           locked={locked}
           scriptData={script}
           onSeek={handleSeek}
+          sectionTarget={sectionTarget}
         />
       </div>
 

@@ -406,23 +406,50 @@ def _detect_table_cells(pdf, script_col, script_words, line_pages, script_lines)
                 continue
 
             used_wis.add(wi)
+            # Store PDF coordinates for direct frontend navigation
+            page_height = page.get_height()
             sections.append({
                 "title":      title,
                 "summary":    _make_summary(wi),
                 "line_index": li,
                 "word_index": wi,
+                "page":       pg_idx,
+                # Shift 20 PDF pts below timestamp char top to align with row content
+                "page_y":     1.0 - ((ts_y - 20) / page_height) if page_height else 0,
+                "_ts_str":    ts_str,  # temporary, used for sorting only
             })
 
     if not sections:
         return None
 
-    sections.sort(key=lambda s: s["word_index"])
+    # Sort by document position (page, then y-position top→bottom) — this naturally
+    # follows chronological order without needing to parse AM/PM from timestamps
+    sections.sort(key=lambda s: (s.get("page", 0), s.get("page_y", 0)))
     seen, unique = set(), []
     for s in sections:
         if s["word_index"] not in seen:
             seen.add(s["word_index"])
+            s.pop("_ts_str", None)  # remove temporary sort key
             unique.append(s)
     return unique
+
+
+def _parse_ts_minutes(ts_str):
+    """Parse timestamp like '4PM', '9:30AM', '12:10' to minutes since midnight."""
+    ts = ts_str.strip().upper()
+    m = re.match(r'^(\d{1,2}):?(\d{2})?\s*(AM|PM)?$', ts)
+    if not m:
+        return 9999
+    hour = int(m.group(1))
+    mins = int(m.group(2) or '0')
+    ampm = m.group(3)
+    if ampm == 'PM' and hour != 12:
+        hour += 12
+    elif ampm == 'AM' and hour == 12:
+        hour = 0
+    elif not ampm and hour < 7:
+        hour += 12  # assume PM for ambiguous times like "1:30" in event contexts
+    return hour * 60 + mins
 
 
 def _detect_script_column(pdf):
